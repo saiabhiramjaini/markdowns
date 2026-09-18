@@ -15,6 +15,75 @@ Replace `{{APP_NAME}}` with your app name (kebab-case, e.g. `my-app`).
 
 Scaffold a production-ready REST API + Next.js frontend app called `{{APP_NAME}}`. Follow every instruction exactly — don't add extras, don't skip steps.
 
+**Write `CLAUDE.md`, `AGENTS.md`, `STANDARDS.md`, and `REVIEW.md` in full from the templates in this prompt.** They are the contract the generated repo lives by. Do not stub, summarize, or omit rules. They must match §0 (errors / logging / observability), the feature-folder split, rate limiting, and the no-Redis-response-cache rule.
+
+Non-interactive CLIs only: `bunx shadcn@latest init -d`. Do not open tweakcn / Neon / Google / Upstash / Vercel in a browser — stub `.env.example` and leave a post-scaffold checklist. Ship a default `globals.css` token set (shadcn Slate + CSS variables).
+
+---
+
+### 0. Exception handling, errors, logging, observability (read first)
+
+Four layers. Do not mix them.
+
+```
+throw ApiError / Error     →   withApi catch
+        │                         │
+        │                         ├─ known ApiError  → HTTP envelope (user-safe)
+        │                         └─ unknown Error   → log.error + HTTP 500 generic
+        │
+log.info / warn / error    →   stdout JSON (+ APP_LOG_FILE). Operators only.
+logAudit(...)              →   audit_logs table. Durable "who did what".
+```
+
+**Exceptions (control flow + crashes)**
+
+- Handlers throw `ApiError(status, code, message)` for expected failures (401, 404, 409, 422, 429). That is not a crash; `withApi` turns it into the error envelope.
+- Handlers throw (or let Drizzle throw) a real `Error` only when something is actually wrong. `withApi` logs it and returns `500 { error: { code: "internal_error", message: "Something went wrong." } }`. Never put `err.message` or a stack in the HTTP body.
+- `try/catch` lives in **one place**: `withApi`. Route files do not add a second catch. Queries/mutations do not catch-and-swallow.
+- Unique-key collisions are mapped to `ApiError(409)` in mutations (`pg` code `23505`). Empty PATCH bodies are `ApiError(400)`.
+- Process crashes: `uncaughtException` → `log.fatal` in a Node-only `process-handlers.ts` (not inside `instrumentation.ts` — Next's Edge scanner will warn). `unhandledRejection` → `log.error`, do not `process.exit`.
+
+**Error handling (what the client sees)**
+
+Envelope is the entire public contract:
+
+```json
+{ "data": { } }                                  // 2xx with a body
+{ "error": { "code": "not_found", "message": "Thing not found." } }   // 4xx/5xx
+```
+
+- 204 DELETE has no body.
+- List endpoints: `{ "data": { "items": [], "next_cursor": null } }`.
+- Codes: `unauthorized` `forbidden` `validation_error` `bad_request` `unsupported_media_type` `payload_too_large` `not_found` `conflict` `rate_limited` `internal_error`.
+- Other users' ids → **404**, not 403 (do not leak existence).
+- User-facing `message` is canned English. Internals go in the log.
+
+**Logging (operators, not users)**
+
+Pino only. `console.*` is an ESLint error. Signature: `log.<level>({ ...context }, "feature.verb")`.
+
+| Level | When |
+|---|---|
+| `fatal` | Process is going down |
+| `error` | Request/job actually failed (5xx, thrown Error, persistence failed) |
+| `warn` | Recoverable (expected 4xx already returned, rate limiter down, retryable) |
+| `info` | State change (`things.created`) |
+| `debug` | Off in prod unless `LOG_LEVEL=debug` |
+
+Every API line includes `requestId` + `userId` (and `tokenId` when a Bearer token was used). Failures include `{ err }` so the serializer keeps stack + cause. Never log secrets; the redactor is backup, not permission to log `authorization`.
+
+`log.info` is **not** the audit trail. Writes also call `logAudit`.
+
+**Observability (how you find a request later)**
+
+- `x-request-id`: honor inbound or mint a UUID; echo on every `/api/v1` response; bind `log.child({ requestId })`. Authenticated responses also set `Cache-Control: private, no-store`.
+- Dual fields on every line: `level` (Datadog) + `severity` (GCP Cloud Logging).
+- `service` from `DD_SERVICE` (default `{{APP_NAME}}`). Sidecar tails `APP_LOG_FILE` if set; stdout always; never throw at import if the file path is dead.
+- `APP_ENV=local|dev|prod` is a **build ARG**. `NODE_ENV` is `production` on every image and must not drive source maps. Browser source maps on for local/dev, **off for prod**.
+- `/api/health` → `SELECT 1` → 503 if the DB is down (Cloud Run probe this, not `/`).
+- Client errors POST to `/api/log/client-error` (same-origin, Zod, size cap, IP rate limit) and become `log.error(..., "client.error_reported")`.
+- Next `onRequestError` logs render/route explosions as `request.error`.
+
 ---
 
 ### 1. Init
@@ -98,24 +167,19 @@ Add to root `package.json`:
 
 ### 3. shadcn/ui + theme
 
-**Step 1 — Init shadcn:**
+**Step 1 — Init shadcn (non-interactive):**
 ```bash
-bunx shadcn@latest init
+bunx shadcn@latest init -d
 ```
 
-When prompted:
-- Style: **Default**
-- Base color: **Slate**
-- CSS variables: **Yes**
+Defaults (Default style, Neutral/Slate, CSS variables) are fine. Do not wait for a TTY.
 
 **Step 2 — Add the base component set:**
 ```bash
 bunx shadcn@latest add button input label textarea dialog dropdown-menu badge toast card separator skeleton tabs select checkbox radio-group switch tooltip popover sheet command avatar form
 ```
 
-**Step 3 — Get `globals.css` from tweakcn.com:**
-
-Go to [tweakcn.com](https://tweakcn.com) → pick a theme → copy the generated CSS → replace the contents of `src/app/globals.css` entirely with what tweakcn gives you.
+**Step 3 — Theme:** keep the shadcn `globals.css` token set (`background`, `foreground`, `destructive`, `muted-foreground`, …). Optionally replace later from tweakcn.com — not part of codegen.
 
 **Rules:**
 - Always install via `bunx shadcn@latest add <name>` — never copy-paste manually
@@ -219,23 +283,38 @@ DATABASE_URL=postgresql://user:pass@ep-xxx-pooler.region.aws.neon.tech/dbname?ss
 DATABASE_URL_DIRECT=postgresql://user:pass@ep-xxx.region.aws.neon.tech/dbname?sslmode=require
 ```
 
-Create `src/db/index.ts`:
+Create `src/db/index.ts` — **lazy**. `next build` imports this module; a top-level throw on `DATABASE_URL` kills CI.
 ```typescript
 import { Pool } from "pg";
 import { drizzle } from "drizzle-orm/node-postgres";
 import * as schema from "./schema";
 
-const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl) throw new Error("DATABASE_URL is not set");
+import { databaseUrl } from "@/lib/env";
 
-const pool = new Pool({
-  connectionString: databaseUrl,
-  ssl: databaseUrl.includes("sslmode=disable") ? false : { rejectUnauthorized: false },
-});
+type Db = ReturnType<typeof drizzle<typeof schema>>;
 
-export const db = drizzle(pool, { schema });
+let pool: Pool | undefined;
+let cached: Db | undefined;
+
+function sslFor(url: string) {
+  const local = url.includes("localhost") || url.includes("127.0.0.1");
+  if (local || url.includes("sslmode=disable")) return false;
+  return { rejectUnauthorized: true } as const;
+}
+
+/** Call from request handlers / queries — never at module import. */
+export function getDb(): Db {
+  if (cached) return cached;
+  const url = databaseUrl();
+  pool = new Pool({ connectionString: url, ssl: sslFor(url) });
+  cached = drizzle(pool, { schema });
+  return cached;
+}
+
 export * from "./schema";
 ```
+
+Use `getDb().query` / `getDb().insert` everywhere the old code said `db.` (queries, mutations, audit, health).
 
 Create `src/db/schema/index.ts` — re-export all tables from here.
 
@@ -268,7 +347,7 @@ export default defineConfig({
   dialect: "postgresql",
   dbCredentials: {
     url: migrationUrl,
-    ssl: isLocal ? false : { rejectUnauthorized: false },
+    ssl: isLocal ? false : { rejectUnauthorized: true },
   },
 });
 ```
@@ -325,7 +404,7 @@ export const authConfig: NextAuthConfig = {
       authorization: { params: { prompt: "select_account" } },
     }),
   ],
-  session: { strategy: "jwt" },
+  session: { strategy: "jwt" }, // JWT only. Do not add a sessions table. Adapter below persists users/accounts.
   trustHost: true,
   callbacks: {
     async jwt({ token, user }) {
@@ -345,12 +424,18 @@ export const authConfig: NextAuthConfig = {
 ```typescript
 import NextAuth from "next-auth";
 import { DrizzleAdapter } from "@auth/drizzle-adapter";
-import { db } from "@/db";
+import { getDb } from "@/db";
 import { authConfig } from "./lib/config";
+
+const dbProxy = new Proxy({} as ReturnType<typeof getDb>, {
+  get(_target, prop) {
+    return Reflect.get(getDb() as object, prop);
+  },
+});
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   ...authConfig,
-  adapter: DrizzleAdapter(db),
+  adapter: DrizzleAdapter(dbProxy as never),
 });
 ```
 
@@ -440,46 +525,47 @@ export function SignOutButton() {
 }
 ```
 
-Create `src/middleware.ts` — auth guard + IP rate limiting (rate limiter is set up in section 26):
+Create `src/middleware.ts` — UI auth redirect, `/api/v1` CORS + OPTIONS + IP rate limit. **API auth is not here** — `withApi` → `requireApiAuth` (session cookie **or** Bearer token). Webhooks skip rate limit (signature is the gate).
 ```typescript
 import NextAuth from "next-auth";
-import { NextResponse, type NextRequest } from "next/server";
+import { NextResponse } from "next/server";
 import { authConfig } from "@/features/auth/lib/config";
+import { corsHeaders, isAllowedOrigin } from "@/lib/api/cors";
 import { createRateLimiter } from "@/lib/rate-limit";
 import { getIp } from "@/lib/get-ip";
 
 const { auth } = NextAuth(authConfig);
-
-// Broad rate limit applied to all /api/v1/* traffic.
-// Per-route limiters can add tighter limits inside specific route handlers.
 const apiLimiter = createRateLimiter({ windowMs: 60_000, max: 60 });
 
 export default auth(async (req) => {
   const { pathname } = req.nextUrl;
-
-  // Rate limit public + private API routes by IP — webhooks are exempt
-  // (signature verification is their gate).
   const isApiV1 = pathname.startsWith("/api/v1/");
+
+  if (isApiV1 && req.method === "OPTIONS") {
+    if (!isAllowedOrigin(req)) return new NextResponse(null, { status: 403 });
+    return new NextResponse(null, { status: 204, headers: corsHeaders(req) });
+  }
+
   if (isApiV1) {
     const result = await apiLimiter(getIp(req));
     if (!result.allowed) {
       return NextResponse.json(
         { error: { code: "rate_limited", message: "Too many requests." } },
-        { status: 429, headers: { "Retry-After": String(result.retryAfter) } }
+        {
+          status: 429,
+          headers: { "Retry-After": String(result.retryAfter), ...corsHeaders(req) },
+        }
       );
     }
   }
 
-  // Auth guard — redirect unauthenticated users to login (for UI routes)
   const isLoggedIn = !!req.auth;
   const isAuthRoute = pathname.startsWith("/api/auth");
   const isWebhook = pathname.startsWith("/api/webhooks");
   const isPublicPage = ["/login", "/terms", "/privacy"].includes(pathname);
 
   if (isAuthRoute || isWebhook || isPublicPage) return;
-
-  // /api/v1 routes handle their own auth via requireAuth() — let them through.
-  // Unauthenticated requests get 401 from the route handler.
+  // Browser cookie or Bearer — decided in the route. Do not redirect API clients to /login.
   if (isApiV1) return;
 
   if (!isLoggedIn) {
@@ -508,21 +594,76 @@ export function cn(...inputs: ClassValue[]) {
 }
 ```
 
-**`src/lib/api/errors.ts`** — shared `ApiError` class (server + client both import from here):
+**`src/lib/env.ts`** — lazy getters. Call from a request, never at module import.
+```typescript
+function required(name: string): () => string {
+  let cached: string | undefined;
+  return () => {
+    if (cached !== undefined) return cached;
+    const value = process.env[name];
+    if (!value) throw new Error(`${name} is not set`);
+    cached = value;
+    return value;
+  };
+}
+
+export const databaseUrl = required("DATABASE_URL");
+export const authSecret = required("AUTH_SECRET");
+
+export function corsOrigins(): string[] {
+  return (process.env.CORS_ORIGINS ?? process.env.NEXT_PUBLIC_APP_URL ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+export function webhookSecret(): string | undefined {
+  return process.env.WEBHOOK_SECRET;
+}
+```
+
+**`src/lib/app-environment.ts`** — build-time + runtime marker. `NODE_ENV` cannot tell Cloud Run `dev` from `prod`.
+```typescript
+export const APP_ENVIRONMENTS = ["local", "dev", "prod"] as const;
+export type AppEnvironment = (typeof APP_ENVIRONMENTS)[number];
+
+export type EnvironmentSettings = { enableBrowserSourceMaps: boolean };
+
+export const ENVIRONMENT_SETTINGS: Record<AppEnvironment, EnvironmentSettings> = {
+  local: { enableBrowserSourceMaps: true },
+  dev: { enableBrowserSourceMaps: true },
+  prod: { enableBrowserSourceMaps: false },
+};
+
+export function appEnvironment(value: string | undefined): AppEnvironment {
+  return APP_ENVIRONMENTS.includes(value as AppEnvironment) ? (value as AppEnvironment) : "local";
+}
+
+export function getActiveEnvironmentSettings(): EnvironmentSettings {
+  return ENVIRONMENT_SETTINGS[appEnvironment(process.env.APP_ENV)];
+}
+```
+
+**`src/lib/api/errors.ts`** — thrown by handlers; `withApi` is the only catcher. `retryAfter` is for 429.
 ```typescript
 export class ApiError extends Error {
   constructor(
     public status: number,
     public code: string,
-    message: string
+    message: string,
+    public retryAfter?: number
   ) {
     super(message);
     this.name = "ApiError";
   }
 }
+
+export function isPgUniqueViolation(err: unknown): boolean {
+  return typeof err === "object" && err !== null && "code" in err && err.code === "23505";
+}
 ```
 
-**`src/lib/api/response.ts`** — server-side response helpers used by every route handler:
+**`src/lib/api/response.ts`:**
 ```typescript
 import { NextResponse } from "next/server";
 import { log } from "@/lib/log";
@@ -532,18 +673,24 @@ export function apiOk<T>(data: T, status = 200): NextResponse {
   return NextResponse.json({ data }, { status });
 }
 
-export function apiError(err: unknown): NextResponse {
+export function apiNoContent(): NextResponse {
+  return new NextResponse(null, { status: 204 });
+}
+
+export function apiError(err: unknown, extra?: { requestId?: string }): NextResponse {
   if (err instanceof ApiError) {
-    return NextResponse.json(
-      { error: { code: err.code, message: err.message } },
-      { status: err.status }
-    );
+    const headers: Record<string, string> = {};
+    if (err.retryAfter !== undefined) headers["Retry-After"] = String(err.retryAfter);
+    if (extra?.requestId) headers["x-request-id"] = extra.requestId;
+    // 4xx is expected; warn so it does not page like a 500.
+    if (err.status >= 500) log.error({ err, requestId: extra?.requestId }, "api.unhandled_error");
+    else log.warn({ status: err.status, code: err.code, requestId: extra?.requestId }, "api.rejected");
+    return NextResponse.json({ error: { code: err.code, message: err.message } }, { status: err.status, headers });
   }
-  // Unknown errors — log full detail server-side, return generic message
-  log.error({ err }, "api.unhandled_error");
+  log.error({ err, requestId: extra?.requestId }, "api.unhandled_error");
   return NextResponse.json(
     { error: { code: "internal_error", message: "Something went wrong." } },
-    { status: 500 }
+    { status: 500, headers: extra?.requestId ? { "x-request-id": extra.requestId } : undefined }
   );
 }
 
@@ -552,29 +699,165 @@ export function firstError(issues: { message: string }[], fallback: string): str
 }
 ```
 
-**`src/lib/api/auth.ts`** — extracts an `ApiContext` from the request session:
+**`src/lib/api/parse.ts`** — JSON body + query. Throws `ApiError`; do not catch in the route.
 ```typescript
+import { z } from "zod";
+import { ApiError } from "./errors";
+import { firstError } from "./response";
+
+const MAX_JSON_BYTES = 1_000_000;
+
+export async function parseBody<T>(req: Request, schema: z.ZodType<T>): Promise<T> {
+  const contentType = req.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().startsWith("application/json")) {
+    throw new ApiError(415, "unsupported_media_type", "Content-Type must be application/json.");
+  }
+  const declared = Number(req.headers.get("content-length") ?? 0);
+  if (declared > MAX_JSON_BYTES) {
+    throw new ApiError(413, "payload_too_large", "Request body is too large.");
+  }
+  const text = await req.text();
+  if (text.length > MAX_JSON_BYTES) {
+    throw new ApiError(413, "payload_too_large", "Request body is too large.");
+  }
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new ApiError(400, "bad_request", "Invalid JSON.");
+  }
+  const parsed = schema.safeParse(json);
+  if (!parsed.success) {
+    throw new ApiError(400, "validation_error", firstError(parsed.error.issues, "Invalid input"));
+  }
+  return parsed.data;
+}
+
+export function parseQuery<T>(url: string, schema: z.ZodType<T>): T {
+  const parsed = schema.safeParse(Object.fromEntries(new URL(url).searchParams));
+  if (!parsed.success) {
+    throw new ApiError(400, "validation_error", firstError(parsed.error.issues, "Invalid query"));
+  }
+  return parsed.data;
+}
+
+export const UuidParamSchema = z.string().uuid({ message: "Invalid id" });
+```
+
+**`src/lib/api/cors.ts`** — allowlist only. Never `*`. Same-origin Next UI does not need CORS; mobile / extra origins do.
+```typescript
+import { corsOrigins } from "@/lib/env";
+
+export function isAllowedOrigin(req: Request): boolean {
+  const origin = req.headers.get("origin");
+  if (!origin) return true; // same-origin or non-browser
+  return corsOrigins().includes(origin);
+}
+
+export function corsHeaders(req: Request): Record<string, string> {
+  const origin = req.headers.get("origin");
+  if (!origin || !corsOrigins().includes(origin)) return {};
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "GET,POST,PATCH,PUT,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": "content-type,authorization,x-request-id",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin",
+  };
+}
+
+export function applyCors(req: Request, res: Response): Response {
+  const headers = corsHeaders(req);
+  for (const [key, value] of Object.entries(headers)) res.headers.set(key, value);
+  return res;
+}
+```
+
+**`src/lib/api/auth.ts`** — session cookie **or** `Authorization: Bearer`. Same handlers for web, mobile, curl.
+```typescript
+import { createHash, timingSafeEqual } from "node:crypto";
+import { eq, isNull } from "drizzle-orm";
 import { auth } from "@/features/auth";
+import { getDb, apiTokens } from "@/db";
 import { ApiError } from "./errors";
 
 export type ApiContext = {
   userId: string;
+  tokenId?: string;
 };
 
-/**
- * Reads the session and returns an ApiContext. Throws ApiError(401) when
- * unauthenticated — route handlers should let it bubble up to apiError().
- */
-export async function requireAuth(): Promise<ApiContext> {
-  const session = await auth();
-  if (!session?.user?.id) {
-    throw new ApiError(401, "unauthorized", "Authentication required.");
+function sha256(value: string): Buffer {
+  return createHash("sha256").update(value).digest();
+}
+
+function hashesEqual(a: Buffer, b: Buffer): boolean {
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+export async function requireApiAuth(req: Request): Promise<ApiContext> {
+  const header = req.headers.get("authorization");
+  if (header?.toLowerCase().startsWith("bearer ")) {
+    const plaintext = header.slice(7).trim();
+    if (!plaintext) throw new ApiError(401, "unauthorized", "Authentication required.");
+    const digest = sha256(plaintext);
+    const rows = await getDb().query.apiTokens.findMany({
+      where: isNull(apiTokens.revokedAt),
+      columns: { id: true, userId: true, tokenHash: true },
+    });
+    const match = rows.find((row) => hashesEqual(Buffer.from(row.tokenHash, "hex"), digest));
+    if (!match) throw new ApiError(401, "unauthorized", "Authentication required.");
+    return { userId: match.userId, tokenId: match.id };
   }
+
+  const session = await auth();
+  if (!session?.user?.id) throw new ApiError(401, "unauthorized", "Authentication required.");
+  return { userId: session.user.id };
+}
+
+/** UI-only (server components, login). API routes use requireApiAuth. */
+export async function requireSession(): Promise<{ userId: string }> {
+  const session = await auth();
+  if (!session?.user?.id) throw new ApiError(401, "unauthorized", "Authentication required.");
   return { userId: session.user.id };
 }
 ```
 
-**`src/lib/api/client.ts`** — typed fetch wrapper for browser code (React Query hooks call this):
+Token lookup-by-scan is acceptable for the scaffold (few tokens per user). Do not store the plaintext token. Create endpoint hashes once and returns the secret **once**.
+
+**`src/lib/api/with-api.ts`** — the only `try/catch` on `/api/v1`. Binds request-id logger.
+```typescript
+import type { NextRequest } from "next/server";
+import type { Logger } from "pino";
+import { log } from "@/lib/log";
+import { applyCors } from "./cors";
+import { requireApiAuth, type ApiContext } from "./auth";
+import { apiError } from "./response";
+
+export type ApiHandlerContext = ApiContext & { requestId: string; log: Logger; req: NextRequest };
+
+export async function withApi(
+  req: NextRequest,
+  fn: (ctx: ApiHandlerContext) => Promise<Response>
+): Promise<Response> {
+  const requestId = (req.headers.get("x-request-id") ?? crypto.randomUUID()).slice(0, 100);
+  try {
+    const authCtx = await requireApiAuth(req);
+    const reqLog = log.child({ requestId, userId: authCtx.userId, tokenId: authCtx.tokenId });
+    const res = await fn({ ...authCtx, requestId, log: reqLog, req });
+    res.headers.set("x-request-id", requestId);
+    res.headers.set("Cache-Control", "private, no-store");
+    return applyCors(req, res);
+  } catch (err) {
+    const res = apiError(err, { requestId });
+    res.headers.set("x-request-id", requestId);
+    res.headers.set("Cache-Control", "private, no-store");
+    return applyCors(req, res);
+  }
+}
+```
+
+**`src/lib/api/client.ts`** — browser + same-origin. Bearer for non-browser: pass `headers: { authorization: \`Bearer ${token}\` }`. `responseSchema` is required so drift fails at the boundary.
 ```typescript
 import { z } from "zod";
 import { ApiError } from "./errors";
@@ -582,63 +865,58 @@ import { ApiError } from "./errors";
 type RequestOptions<TResponse> = {
   method?: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
   body?: unknown;
-  responseSchema?: z.ZodSchema<TResponse>;
+  responseSchema: z.ZodType<TResponse>;
   headers?: Record<string, string>;
   signal?: AbortSignal;
+  token?: string;
 };
 
-/**
- * Typed fetch wrapper. Throws ApiError on non-2xx so React Query catches
- * it and exposes error.status / error.code to your UI. Validates the
- * response body with Zod if a schema is passed.
- */
 export async function apiFetch<TResponse>(
   path: string,
-  options: RequestOptions<TResponse> = {}
+  options: RequestOptions<TResponse>
 ): Promise<TResponse> {
-  const { method = "GET", body, responseSchema, headers = {}, signal } = options;
-
+  const { method = "GET", body, responseSchema, headers = {}, signal, token } = options;
+  const hasBody = body !== undefined;
   const res = await fetch(path, {
     method,
-    headers: { "content-type": "application/json", ...headers },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    credentials: "include",
+    headers: {
+      ...(hasBody ? { "content-type": "application/json" } : {}),
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...headers,
+    },
+    body: hasBody ? JSON.stringify(body) : undefined,
     signal,
   });
+
+  if (res.status === 204) return undefined as TResponse;
 
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}));
     throw new ApiError(
       res.status,
       errBody?.error?.code ?? "unknown_error",
-      errBody?.error?.message ?? `Request failed: ${res.status}`
+      errBody?.error?.message ?? "Request failed"
     );
   }
 
-  if (res.status === 204) return undefined as TResponse;
-
   const json = await res.json();
-  const data = json?.data ?? json; // unwrap { data } envelope
-
-  if (responseSchema) {
-    const parsed = responseSchema.safeParse(data);
-    if (!parsed.success) {
-      throw new ApiError(500, "invalid_response", "API returned unexpected data shape");
-    }
-    return parsed.data;
+  const parsed = responseSchema.safeParse(json?.data ?? json);
+  if (!parsed.success) {
+    throw new ApiError(500, "invalid_response", "API returned unexpected data shape");
   }
-
-  return data as TResponse;
+  return parsed.data;
 }
 ```
 
-**`src/lib/log.ts`:**
+**`src/lib/log.ts`** — JSON to stdout. Sidecar file is optional. Never throw at import.
 ```typescript
 import pino, { type Logger, type LoggerOptions } from "pino";
 
 const isProd = process.env.NODE_ENV === "production";
 const isTest = process.env.NODE_ENV === "test";
 
-const PINO_TO_SEVERITY: Record<string, string> = {
+const PINO_TO_GCP_SEVERITY: Record<string, string> = {
   trace: "DEBUG", debug: "DEBUG", info: "INFO",
   warn: "WARNING", error: "ERROR", fatal: "CRITICAL",
 };
@@ -648,21 +926,25 @@ const baseOptions: LoggerOptions = {
   serializers: { err: pino.stdSerializers.err, error: pino.stdSerializers.err },
   formatters: {
     level(label) {
-      return { level: label, severity: PINO_TO_SEVERITY[label] ?? label.toUpperCase() };
+      return { level: label, severity: PINO_TO_GCP_SEVERITY[label] ?? label.toUpperCase() };
     },
     bindings() {
-      return { service: "{{APP_NAME}}" };
+      return { service: process.env.DD_SERVICE ?? "{{APP_NAME}}" };
     },
   },
   timestamp: pino.stdTimeFunctions.isoTime,
   redact: {
     paths: [
-      "password", "*.password", "token", "*.token", "accessToken", "*.accessToken",
-      "refreshToken", "*.refreshToken", "apiKey", "*.apiKey", "secret", "*.secret",
+      "password", "*.password", "*.*.password",
+      "token", "*.token", "*.*.token",
+      "accessToken", "*.accessToken", "refreshToken", "*.refreshToken",
+      "apiKey", "*.apiKey", "api_key", "*.api_key",
+      "secret", "*.secret", "webhookSecret", "*.webhookSecret",
       "authorization", "*.authorization", "headers.authorization", "headers.cookie",
       "privateKey", "*.privateKey", "credentials", "*.credentials",
     ],
     censor: "[REDACTED]",
+    remove: false,
   },
 };
 
@@ -671,11 +953,55 @@ const devTransport: LoggerOptions["transport"] =
     ? { target: "pino-pretty", options: { colorize: true, translateTime: "SYS:HH:MM:ss.l", ignore: "pid,hostname,service,severity" } }
     : undefined;
 
-export const log: Logger = pino({ ...baseOptions, ...(devTransport ? { transport: devTransport } : {}) });
+function buildDestination(): pino.DestinationStream | undefined {
+  const appLogFile = process.env.APP_LOG_FILE;
+  if (!appLogFile || devTransport) return undefined;
+  try {
+    const fileStream = pino.destination({ dest: appLogFile, mkdir: true, sync: false });
+    fileStream.on("error", () => {});
+    return pino.multistream([
+      { stream: pino.destination({ dest: 1, sync: false }) },
+      { stream: fileStream },
+    ]);
+  } catch (err) {
+    process.stderr.write(
+      `[log] APP_LOG_FILE unusable, stdout only: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+    return undefined;
+  }
+}
+
+const destination = buildDestination();
+
+export const log: Logger = devTransport
+  ? pino({ ...baseOptions, transport: devTransport })
+  : destination
+    ? pino(baseOptions, destination)
+    : pino(baseOptions);
 
 export function getClientIp(headers: Headers): string | null {
   const xff = headers.get("x-forwarded-for");
   return xff?.split(",")[0]?.trim() || headers.get("x-real-ip") || null;
+}
+```
+
+**`src/lib/process-handlers.ts`** — Node-only. Do not put `process.on` in `instrumentation.ts` (Edge scanner).
+```typescript
+import { log } from "./log";
+
+export function attachProcessHandlers(): void {
+  if ((globalThis as { __processHandlers?: boolean }).__processHandlers) return;
+  (globalThis as { __processHandlers?: boolean }).__processHandlers = true;
+
+  process.on("uncaughtException", (err) => {
+    log.fatal({ err }, "process.uncaught_exception");
+  });
+  process.on("unhandledRejection", (reason) => {
+    log.error(
+      { err: reason instanceof Error ? reason : new Error(String(reason)) },
+      "process.unhandled_rejection"
+    );
+  });
 }
 ```
 
@@ -695,16 +1021,19 @@ export function getIp(req: NextRequest): string {
 **`src/lib/audit.ts`:**
 ```typescript
 import { headers } from "next/headers";
-import { db } from "@/db";
-import { auditLogs } from "@/db/schema";
+import { getDb, auditLogs } from "@/db";
 import { getClientIp } from "@/lib/log";
 
 export type AuditAction =
   | "auth.login"
   | "auth.logout"
   | "user.updated"
-  | "user.deleted";
-  // Extend per feature — e.g. "post.created", "comment.deleted"
+  | "user.deleted"
+  | "thing.created"
+  | "thing.updated"
+  | "thing.deleted"
+  | "api_token.created"
+  | "api_token.revoked";
 
 type LogAuditParams = {
   userId: string | null;
@@ -724,7 +1053,7 @@ async function readRequestMeta(): Promise<{ ip: string | null; userAgent: string
 
 export async function logAudit(params: LogAuditParams): Promise<void> {
   const meta = await readRequestMeta();
-  await db.insert(auditLogs).values({
+  await getDb().insert(auditLogs).values({
     userId: params.userId,
     action: params.action,
     resource: params.resource,
@@ -735,7 +1064,7 @@ export async function logAudit(params: LogAuditParams): Promise<void> {
 }
 ```
 
-Create the audit table at `src/db/schema/audit-logs.ts`:
+Create `src/db/schema/audit-logs.ts`:
 ```typescript
 import { jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { users } from "./users";
@@ -751,6 +1080,25 @@ export const auditLogs = pgTable("audit_logs", {
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 ```
+
+Create `src/db/schema/api-tokens.ts` — store **hash only**. Prefix is for UI display (`ns_ab12…`).
+```typescript
+import { pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { users } from "./users";
+
+export const apiTokens = pgTable("api_tokens", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  tokenHash: text("token_hash").notNull(),
+  prefix: text("prefix").notNull(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  lastUsedAt: timestamp("last_used_at"),
+  revokedAt: timestamp("revoked_at"),
+});
+```
+
+Re-export `apiTokens` from `src/db/schema/index.ts`.
 
 ---
 
@@ -816,86 +1164,92 @@ Same schema file is the single source of truth for both ends.
 
 ### 10. Logger conventions
 
-Pino is the **only** logger. `console.log` is banned server-side.
+Pino is the **only** logger. ESLint `"no-console": "error"` in app code (off in `**/*.test.ts`). See §0 for levels and the split vs HTTP errors.
 
 **Always: context object first, message string second**
 ```typescript
-log.info({ userId, thingId: row.id }, "things.created");
-log.error({ userId, route: "/api/v1/things", err }, "things.create_failed");
-
-// ❌ String interpolation kills structured search
-log.info(`Created thing ${row.id}`);
+ctx.log.info({ thingId: row.id }, "things.created");
+ctx.log.error({ thingId, err }, "things.create_failed");
 ```
 
-**Event name format: `feature.verb`**
-```
-"auth.login"          "things.created"          "stripe.webhook_received"
-```
+Event names: `feature.verb` / `feature.verb_state` — `things.created`, `things.delete_failed`, `webhooks.stripe.received`.
 
-**Log levels:**
+On `/api/v1`, use `ctx.log` from `withApi` (already bound to `requestId` + `userId`). Do not call the root `log` from a handler except process-level code.
 
-| Level | When | Always include |
-|---|---|---|
-| `log.fatal` | Process is going down | `err` |
-| `log.error` | Request failed | `err` + context |
-| `log.warn` | Recoverable degradation | context |
-| `log.info` | State change worth audit | `userId` |
-| `log.debug` | Dev-only | anything |
+**Never log secrets** — even at debug. Log shape (`keyPrefix: key.slice(0, 4)`), not the value.
 
-**Never log sensitive values** — even at debug. Log shapes, not values:
-```typescript
-// ❌
-log.info({ apiKey: input.apiKey }, "integration.key_set");
-
-// ✅
-log.info({ userId, provider, keyPrefix: key.slice(0, 4) }, "integration.key_set");
-```
-
-**Child logger for request-scoped context:**
-```typescript
-const reqLog = log.child({ requestId, userId });
-reqLog.info("things.created");
-```
-
-**Client-side errors** — use `reportClientError()`:
-```tsx
-import { toast } from "sonner";
-import { reportClientError } from "@/lib/report-client-error";
-
-try {
-  await mutation.mutateAsync(input);
-} catch (err) {
-  reportClientError(err, { feature: "things" });
-  toast.error("Something went wrong.");
-}
-```
+**Client-side errors** — `reportClientError()` + `toast.error`. Never `console.error`, never swallow.
 
 Create `src/lib/report-client-error.ts`:
 ```typescript
-export function reportClientError(err: unknown, context?: Record<string, unknown>): void {
+export function reportClientError(err: unknown, source = "unknown"): void {
+  if (typeof window === "undefined") return;
   const message = err instanceof Error ? err.message : String(err);
   const stack = err instanceof Error ? err.stack : undefined;
   fetch("/api/log/client-error", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ message, stack, context }),
+    body: JSON.stringify({
+      message: message.slice(0, 2_000),
+      stack: stack?.slice(0, 8_000),
+      source: source.slice(0, 50),
+      url: window.location.href.slice(0, 2_000),
+    }),
+    keepalive: true,
+    credentials: "same-origin",
   }).catch(() => {});
 }
 ```
 
-Create `src/app/api/log/client-error/route.ts`:
+Create `src/app/api/log/client-error/route.ts` — same-origin, Zod, size cap, IP rate limit. Reconstruct an `Error` so Pino's `err` serializer matches server errors.
 ```typescript
 import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
 import { log } from "@/lib/log";
+import { getIp } from "@/lib/get-ip";
 
 export const runtime = "nodejs";
 
+const Schema = z.object({
+  message: z.string().min(1).max(2_000),
+  stack: z.string().max(8_000).optional(),
+  source: z.string().min(1).max(50),
+  url: z.string().max(2_000).optional(),
+});
+
+const buckets = new Map<string, { count: number; resetAt: number }>();
+
+function allow(ip: string): boolean {
+  const now = Date.now();
+  const b = buckets.get(ip);
+  if (!b || b.resetAt <= now) {
+    buckets.set(ip, { count: 1, resetAt: now + 60_000 });
+    return true;
+  }
+  if (b.count >= 10) return false;
+  b.count += 1;
+  return true;
+}
+
 export async function POST(req: NextRequest): Promise<NextResponse> {
-  try {
-    const body = await req.json();
-    log.error({ ...body, source: "client" }, "client.error");
-  } catch {}
-  return NextResponse.json({ ok: true });
+  const origin = req.headers.get("origin");
+  const app = process.env.NEXT_PUBLIC_APP_URL;
+  if (origin && app && origin !== new URL(app).origin) {
+    return new NextResponse(null, { status: 204 });
+  }
+  if (Number(req.headers.get("content-length") ?? 0) > 12_000) {
+    return new NextResponse(null, { status: 413 });
+  }
+  const ip = getIp(req);
+  if (!allow(ip)) return new NextResponse(null, { status: 429 });
+
+  const parsed = Schema.safeParse(await req.json().catch(() => null));
+  if (!parsed.success) return new NextResponse(null, { status: 400 });
+
+  const err = new Error(parsed.data.message);
+  if (parsed.data.stack) err.stack = parsed.data.stack;
+  log.error({ err, source: parsed.data.source, client: { url: parsed.data.url, ip } }, "client.error_reported");
+  return new NextResponse(null, { status: 204 });
 }
 ```
 
@@ -920,7 +1274,7 @@ src/features/<name>/
 And the HTTP routes:
 ```
 src/app/api/v1/<resource>/
-  route.ts        ← Thin HTTP adapter: parse body → requireAuth → safeParse → call handler → respond
+  route.ts        ← Thin HTTP adapter: withApi → parseBody/parseQuery → handler → apiOk
   [id]/route.ts   ← GET, PATCH, DELETE for a single resource
 ```
 
@@ -928,8 +1282,8 @@ src/app/api/v1/<resource>/
 
 | File | Responsibility | Imports |
 |---|---|---|
-| `handlers.ts` | Pure business logic. Takes `(ctx, input)`, returns data or throws `ApiError`. No `Request`, no parsing, no auth — caller's job. | DB queries, audit, log |
-| `route.ts` | HTTP adapter. Parses body, calls `requireAuth(req)`, validates with Zod, calls handler, formats response. | `requireAuth`, schemas, `handlers` |
+| `handlers.ts` | Pure business logic. Takes `(ctx, input)`, returns data or throws `ApiError`. No `Request`, no parsing, no auth — `withApi`'s job. | DB queries, audit, log |
+| `route.ts` | HTTP adapter. `withApi` auths (cookie or Bearer), `parseBody` / `parseQuery`, calls handler, returns envelope. | `withApi`, schemas, `handlers` |
 
 This split means:
 - Handlers are unit-testable without HTTP — pass a mock `ctx`, assert the return value
@@ -981,21 +1335,28 @@ export const ThingSchema = z.object({
   updatedAt: z.string().datetime(),
 });
 
-export const ThingsResponseSchema = z.array(ThingSchema);
+export const ThingPageSchema = z.object({
+  items: z.array(ThingSchema),
+  next_cursor: z.string().uuid().nullable(),
+});
 
-// ── Inferred types ─────────────────────────────────────────────────────────
+export const ListThingsQuerySchema = z.object({
+  cursor: z.string().uuid().optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
 
 export type CreateThingInput = z.infer<typeof CreateThingInputSchema>;
 export type UpdateThingInput = z.infer<typeof UpdateThingInputSchema>;
 export type Thing = z.infer<typeof ThingSchema>;
+export type ThingPage = z.infer<typeof ThingPageSchema>;
+export type ListThingsQuery = z.infer<typeof ListThingsQuerySchema>;
 ```
 
-**`queries.ts`** — DB reads:
+**`queries.ts`** — DB reads. List is **cursor + stable order** (`created_at desc, id desc`). Never return an unbounded table.
 ```typescript
-import { and, eq } from "drizzle-orm";
-import { db } from "@/db";
-import { things } from "@/db/schema";
-import type { Thing } from "./schema";
+import { and, desc, eq, lt, or } from "drizzle-orm";
+import { getDb, things } from "@/db";
+import type { ListThingsQuery, Thing } from "./schema";
 
 type ThingRow = typeof things.$inferSelect;
 
@@ -1009,41 +1370,63 @@ function toThing(row: ThingRow): Thing {
   };
 }
 
-export async function listUserThings(userId: string): Promise<Thing[]> {
+export async function listUserThings(userId: string, query: ListThingsQuery): Promise<{ items: Thing[]; next_cursor: string | null }> {
+  const db = getDb();
+  let cursorRow: ThingRow | undefined;
+  if (query.cursor) {
+    cursorRow = await db.query.things.findFirst({
+      where: and(eq(things.id, query.cursor), eq(things.userId, userId)),
+    });
+  }
   const rows = await db.query.things.findMany({
-    where: eq(things.userId, userId),
-    orderBy: (t, { desc }) => [desc(t.createdAt)],
+    where: cursorRow
+      ? and(
+          eq(things.userId, userId),
+          or(
+            lt(things.createdAt, cursorRow.createdAt),
+            and(eq(things.createdAt, cursorRow.createdAt), lt(things.id, cursorRow.id))
+          )
+        )
+      : eq(things.userId, userId),
+    orderBy: [desc(things.createdAt), desc(things.id)],
+    limit: query.limit + 1,
   });
-  return rows.map(toThing);
+  const extra = rows.length > query.limit;
+  const page = extra ? rows.slice(0, query.limit) : rows;
+  return {
+    items: page.map(toThing),
+    next_cursor: extra ? page[page.length - 1]!.id : null,
+  };
 }
 
 export async function findUserThing(userId: string, id: string): Promise<Thing | null> {
-  const row = await db.query.things.findFirst({
+  const row = await getDb().query.things.findFirst({
     where: and(eq(things.id, id), eq(things.userId, userId)),
   });
   return row ? toThing(row) : null;
 }
 ```
 
-**`mutations.ts`** — DB writes (no `"use server"`):
+**`mutations.ts`** — DB writes (no `"use server"`). Map unique violations to 409.
 ```typescript
 import { and, eq } from "drizzle-orm";
-import { db } from "@/db";
-import { things } from "@/db/schema";
+import { getDb, things } from "@/db";
+import { ApiError, isPgUniqueViolation } from "@/lib/api/errors";
 import type { CreateThingInput, UpdateThingInput, Thing } from "./schema";
 import { findUserThing } from "./queries";
 
 export async function insertThing(userId: string, input: CreateThingInput): Promise<Thing | null> {
-  const [row] = await db
-    .insert(things)
-    .values({
-      userId,
-      name: input.name,
-      description: input.description ?? null,
-    })
-    .returning();
-  if (!row) return null;
-  return findUserThing(userId, row.id);
+  try {
+    const [row] = await getDb()
+      .insert(things)
+      .values({ userId, name: input.name, description: input.description ?? null })
+      .returning();
+    if (!row) return null;
+    return findUserThing(userId, row.id);
+  } catch (err) {
+    if (isPgUniqueViolation(err)) throw new ApiError(409, "conflict", "A thing with those values already exists.");
+    throw err;
+  }
 }
 
 export async function updateThing(
@@ -1051,19 +1434,24 @@ export async function updateThing(
   id: string,
   fields: UpdateThingInput
 ): Promise<Thing | null> {
-  await db
-    .update(things)
-    .set({ ...fields, updatedAt: new Date() })
-    .where(and(eq(things.id, id), eq(things.userId, userId)));
-  return findUserThing(userId, id);
+  try {
+    await getDb()
+      .update(things)
+      .set({ ...fields, updatedAt: new Date() })
+      .where(and(eq(things.id, id), eq(things.userId, userId)));
+    return findUserThing(userId, id);
+  } catch (err) {
+    if (isPgUniqueViolation(err)) throw new ApiError(409, "conflict", "A thing with those values already exists.");
+    throw err;
+  }
 }
 
 export async function deleteThing(userId: string, id: string): Promise<void> {
-  await db.delete(things).where(and(eq(things.id, id), eq(things.userId, userId)));
+  await getDb().delete(things).where(and(eq(things.id, id), eq(things.userId, userId)));
 }
 ```
 
-**`handlers.ts`** — pure business logic. Receives `ApiContext`, returns data or throws `ApiError`. Does NOT touch `Request`, `NextResponse`, or HTTP concerns:
+**`handlers.ts`** — `(ctx, input) → data` or `throw ApiError`. No `Request`, no parse, no auth. Logging uses the root `log` plus `userId` from ctx (requestId is already on the route's child logger when you pass ctx.log — if ctx is only ApiContext, use `log.info({ userId: ctx.userId, ...})`).
 ```typescript
 import type { ApiContext } from "@/lib/api/auth";
 import { ApiError } from "@/lib/api/errors";
@@ -1071,10 +1459,10 @@ import { log } from "@/lib/log";
 import { logAudit } from "@/lib/audit";
 import { findUserThing, listUserThings } from "./queries";
 import { insertThing, updateThing, deleteThing } from "./mutations";
-import type { CreateThingInput, UpdateThingInput, Thing } from "./schema";
+import type { CreateThingInput, ListThingsQuery, Thing, ThingPage, UpdateThingInput } from "./schema";
 
-export async function listThings(ctx: ApiContext): Promise<Thing[]> {
-  return listUserThings(ctx.userId);
+export async function listThings(ctx: ApiContext, query: ListThingsQuery): Promise<ThingPage> {
+  return listUserThings(ctx.userId, query);
 }
 
 export async function getThing(ctx: ApiContext, id: string): Promise<Thing> {
@@ -1086,7 +1474,6 @@ export async function getThing(ctx: ApiContext, id: string): Promise<Thing> {
 export async function createThing(ctx: ApiContext, input: CreateThingInput): Promise<Thing> {
   const thing = await insertThing(ctx.userId, input);
   if (!thing) throw new ApiError(500, "internal_error", "Could not create thing.");
-
   log.info({ userId: ctx.userId, thingId: thing.id }, "things.created");
   await logAudit({
     userId: ctx.userId,
@@ -1094,82 +1481,64 @@ export async function createThing(ctx: ApiContext, input: CreateThingInput): Pro
     resource: thing.id,
     metadata: { name: input.name },
   });
-
   return thing;
 }
 
-export async function patchThing(
-  ctx: ApiContext,
-  id: string,
-  input: UpdateThingInput
-): Promise<Thing> {
-  // Verify ownership before update — surface 404 not 500
+export async function patchThing(ctx: ApiContext, id: string, input: UpdateThingInput): Promise<Thing> {
+  if (input.name === undefined && input.description === undefined) {
+    throw new ApiError(400, "bad_request", "No fields to update.");
+  }
   const existing = await findUserThing(ctx.userId, id);
   if (!existing) throw new ApiError(404, "not_found", "Thing not found.");
-
   const updated = await updateThing(ctx.userId, id, input);
   if (!updated) throw new ApiError(500, "internal_error", "Could not update thing.");
-
   log.info({ userId: ctx.userId, thingId: id }, "things.updated");
+  await logAudit({ userId: ctx.userId, action: "thing.updated", resource: id });
   return updated;
 }
 
 export async function removeThing(ctx: ApiContext, id: string): Promise<void> {
   const existing = await findUserThing(ctx.userId, id);
   if (!existing) throw new ApiError(404, "not_found", "Thing not found.");
-
   await deleteThing(ctx.userId, id);
-
   log.info({ userId: ctx.userId, thingId: id }, "things.deleted");
   await logAudit({ userId: ctx.userId, action: "thing.deleted", resource: id });
 }
 ```
 
-**`src/app/api/v1/things/route.ts`** — collection endpoint (list, create):
+**`src/app/api/v1/things/route.ts`** — thin HTTP adapter. `withApi` is the only catch.
 ```typescript
 import type { NextRequest } from "next/server";
-import { apiOk, apiError, firstError } from "@/lib/api/response";
-import { ApiError } from "@/lib/api/errors";
-import { requireAuth } from "@/lib/api/auth";
+import { withApi } from "@/lib/api/with-api";
+import { apiOk } from "@/lib/api/response";
+import { parseBody, parseQuery } from "@/lib/api/parse";
 import { listThings, createThing } from "@/features/things/handlers";
-import { CreateThingInputSchema } from "@/features/things/schema";
+import { CreateThingInputSchema, ListThingsQuerySchema } from "@/features/things/schema";
 
 export const runtime = "nodejs";
 
-export async function GET() {
-  try {
-    const ctx = await requireAuth();
-    const things = await listThings(ctx);
-    return apiOk(things);
-  } catch (err) {
-    return apiError(err);
-  }
+export function GET(req: NextRequest) {
+  return withApi(req, async (ctx) => {
+    const query = parseQuery(req.url, ListThingsQuerySchema);
+    return apiOk(await listThings(ctx, query));
+  });
 }
 
-export async function POST(req: NextRequest) {
-  try {
-    const ctx = await requireAuth();
-    const body = await req.json().catch(() => {
-      throw new ApiError(400, "bad_request", "Invalid JSON.");
-    });
-    const parsed = CreateThingInputSchema.safeParse(body);
-    if (!parsed.success) {
-      throw new ApiError(400, "validation_error", firstError(parsed.error.issues, "Invalid input"));
-    }
-    const thing = await createThing(ctx, parsed.data);
-    return apiOk(thing, 201);
-  } catch (err) {
-    return apiError(err);
-  }
+export function POST(req: NextRequest) {
+  return withApi(req, async (ctx) => {
+    const input = await parseBody(req, CreateThingInputSchema);
+    return apiOk(await createThing(ctx, input), 201);
+  });
 }
 ```
 
-**`src/app/api/v1/things/[id]/route.ts`** — single-resource endpoint:
+**`src/app/api/v1/things/[id]/route.ts`:**
 ```typescript
 import type { NextRequest } from "next/server";
-import { apiOk, apiError, firstError } from "@/lib/api/response";
+import { withApi } from "@/lib/api/with-api";
+import { apiOk, apiNoContent } from "@/lib/api/response";
+import { parseBody, UuidParamSchema } from "@/lib/api/parse";
 import { ApiError } from "@/lib/api/errors";
-import { requireAuth } from "@/lib/api/auth";
 import { getThing, patchThing, removeThing } from "@/features/things/handlers";
 import { UpdateThingInputSchema } from "@/features/things/schema";
 
@@ -1177,60 +1546,55 @@ export const runtime = "nodejs";
 
 type Context = { params: Promise<{ id: string }> };
 
-export async function GET(_req: NextRequest, { params }: Context) {
-  try {
-    const ctx = await requireAuth();
-    const { id } = await params;
-    const thing = await getThing(ctx, id);
-    return apiOk(thing);
-  } catch (err) {
-    return apiError(err);
-  }
+function parseId(id: string): string {
+  const parsed = UuidParamSchema.safeParse(id);
+  if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid id");
+  return parsed.data;
 }
 
-export async function PATCH(req: NextRequest, { params }: Context) {
-  try {
-    const ctx = await requireAuth();
+export function GET(req: NextRequest, { params }: Context) {
+  return withApi(req, async (ctx) => {
     const { id } = await params;
-    const body = await req.json().catch(() => {
-      throw new ApiError(400, "bad_request", "Invalid JSON.");
-    });
-    const parsed = UpdateThingInputSchema.safeParse(body);
-    if (!parsed.success) {
-      throw new ApiError(400, "validation_error", firstError(parsed.error.issues, "Invalid input"));
-    }
-    const thing = await patchThing(ctx, id, parsed.data);
-    return apiOk(thing);
-  } catch (err) {
-    return apiError(err);
-  }
+    return apiOk(await getThing(ctx, parseId(id)));
+  });
 }
 
-export async function DELETE(_req: NextRequest, { params }: Context) {
-  try {
-    const ctx = await requireAuth();
+export function PATCH(req: NextRequest, { params }: Context) {
+  return withApi(req, async (ctx) => {
     const { id } = await params;
-    await removeThing(ctx, id);
-    return new Response(null, { status: 204 });
-  } catch (err) {
-    return apiError(err);
-  }
+    const input = await parseBody(req, UpdateThingInputSchema);
+    return apiOk(await patchThing(ctx, parseId(id), input));
+  });
+}
+
+export function DELETE(req: NextRequest, { params }: Context) {
+  return withApi(req, async (ctx) => {
+    const { id } = await params;
+    await removeThing(ctx, parseId(id));
+    return apiNoContent();
+  });
 }
 ```
 
 **`api.ts`** — client-side fetch wrappers (used by React Query hooks):
 ```typescript
+import { z } from "zod";
 import { apiFetch } from "@/lib/api/client";
 import {
   ThingSchema,
-  ThingsResponseSchema,
+  ThingPageSchema,
   type CreateThingInput,
   type UpdateThingInput,
   type Thing,
+  type ThingPage,
+  type ListThingsQuery,
 } from "./schema";
 
-export function listThings(): Promise<Thing[]> {
-  return apiFetch("/api/v1/things", { responseSchema: ThingsResponseSchema });
+export function listThings(query: ListThingsQuery = { limit: 20 }): Promise<ThingPage> {
+  const q = new URLSearchParams();
+  if (query.cursor) q.set("cursor", query.cursor);
+  q.set("limit", String(query.limit ?? 20));
+  return apiFetch(`/api/v1/things?${q}`, { responseSchema: ThingPageSchema });
 }
 
 export function getThing(id: string): Promise<Thing> {
@@ -1238,23 +1602,15 @@ export function getThing(id: string): Promise<Thing> {
 }
 
 export function createThing(input: CreateThingInput): Promise<Thing> {
-  return apiFetch("/api/v1/things", {
-    method: "POST",
-    body: input,
-    responseSchema: ThingSchema,
-  });
+  return apiFetch("/api/v1/things", { method: "POST", body: input, responseSchema: ThingSchema });
 }
 
 export function updateThing(id: string, input: UpdateThingInput): Promise<Thing> {
-  return apiFetch(`/api/v1/things/${id}`, {
-    method: "PATCH",
-    body: input,
-    responseSchema: ThingSchema,
-  });
+  return apiFetch(`/api/v1/things/${id}`, { method: "PATCH", body: input, responseSchema: ThingSchema });
 }
 
 export function deleteThing(id: string): Promise<void> {
-  return apiFetch(`/api/v1/things/${id}`, { method: "DELETE" });
+  return apiFetch(`/api/v1/things/${id}`, { method: "DELETE", responseSchema: z.undefined() });
 }
 ```
 
@@ -1331,17 +1687,22 @@ Every handler throws `ApiError(status, code, message)` for non-2xx outcomes. Use
 
 #### Response envelope
 
-**Success** (any 2xx with a body):
+**Success (resource):**
 ```json
 { "data": { "id": "...", "name": "..." } }
 ```
 
-**Error** (any 4xx or 5xx):
+**Success (list):**
+```json
+{ "data": { "items": [], "next_cursor": null } }
+```
+
+**Error (any 4xx or 5xx):**
 ```json
 { "error": { "code": "validation_error", "message": "Name is required" } }
 ```
 
-The wrapper is consistent across every endpoint so consumers can write one error handler.
+Echo `x-request-id` on every `/api/v1` response. 204 DELETE has no body.
 
 ---
 
@@ -1679,12 +2040,19 @@ src/
     api/
       errors.ts
       response.ts          ← apiOk, apiError, firstError
-      auth.ts              ← requireAuth, ApiContext
+      auth.ts              ← requireApiAuth, ApiContext
+      with-api.ts          ← withApi
+      parse.ts             ← parseBody, parseQuery
+      cors.ts
       client.ts            ← apiFetch
+    env.ts                 ← lazy getters; never throw at import
+    app-environment.ts     ← APP_ENV local|dev|prod
     log.ts
+    process-handlers.ts    ← uncaughtException / unhandledRejection
     audit.ts
     get-ip.ts
-    rate-limit.ts
+    rate-limit.ts          ← IP sliding window; Redis for this only
+    webhook.ts             ← HMAC on raw body
     report-client-error.ts
     utils.ts
   components/
@@ -1696,6 +2064,7 @@ src/
       index.ts
       users.ts
       audit-logs.ts
+      api-tokens.ts
   types/
     next-auth.d.ts
   test/
@@ -1721,14 +2090,14 @@ export default async function PlatformLayout({ children }: { children: React.Rea
 **`src/app/api/health/route.ts`:**
 ```typescript
 import { NextResponse } from "next/server";
-import { db } from "@/db";
 import { sql } from "drizzle-orm";
+import { getDb } from "@/db";
 
 export const runtime = "nodejs";
 
 export async function GET() {
   try {
-    await db.execute(sql`SELECT 1`);
+    await getDb().execute(sql`SELECT 1`);
     return NextResponse.json({ ok: true });
   } catch {
     return NextResponse.json({ ok: false }, { status: 503 });
@@ -1873,7 +2242,16 @@ AUTH_GOOGLE_SECRET=your-google-oauth-client-secret
 
 # App
 NEXT_PUBLIC_APP_URL=http://localhost:3000
+APP_ENV=local
 LOG_LEVEL=debug
+DD_SERVICE={{APP_NAME}}
+# APP_LOG_FILE=/shared-volume/logs/app.log
+
+# CORS allowlist for /api/v1 (comma-separated). Same-origin UI does not need this.
+CORS_ORIGINS=http://localhost:3000
+
+# Webhook HMAC (raw-body verify). Optional until you add a vendor.
+WEBHOOK_SECRET=
 
 # Upstash Redis (rate limiting)
 UPSTASH_REDIS_REST_URL=https://your-db.upstash.io
@@ -1905,6 +2283,14 @@ Add to `.gitignore`:
   }
 }
 ```
+
+**ESLint — `eslint.config.mjs`.** Keep Next's defaults and set:
+```js
+{
+  rules: { "no-console": "error" },
+}
+```
+In the `ignores` / file override for `**/*.{test,spec}.{ts,tsx}` and `scripts/**`, set `"no-console": "off"`.
 
 ---
 
@@ -1993,156 +2379,185 @@ export default async function ThingsPage() {
 
 ### 18. STANDARDS.md
 
-Create `STANDARDS.md`:
+Write `STANDARDS.md` in full from this template. Do not stub, summarize, or omit rules. It is the contract for humans and coding agents and must match §0.
 
 ```markdown
 # STANDARDS.md
 
 Engineering rules for this repo. Every code change should satisfy them.
 
-1. **No `any`, no `as` casts on user input** — validate with Zod at every boundary
-2. **`safeParse` everywhere, `firstError` for the user message** — never `.parse()`
-3. **Every route handler returns `apiOk(data)` or throws `ApiError`** — never raw `NextResponse.json` for success/error responses
-4. **`requireAuth()` is the first line of every protected route handler** — before any DB call
-5. **`handlers.ts` is HTTP-agnostic** — never imports `Request`, `NextResponse`, or `headers()`. Pure `(ctx, input) → output` shape
-6. **No `console.log` server-side** — use `log` from `@/lib/log`
-7. **`log.info` + `logAudit` after every state change** — state changes have an audit trail
-8. **No top-level `throw` for runtime env vars** — lazy getter pattern only
-9. **`"use server"` only in `features/auth/actions.ts`** — every other mutation goes through `/api/v1/*`
-10. **API responses follow the envelope** — success: `{ data: ... }`, error: `{ error: { code, message } }`
-11. **API routes live under `/api/v1/`** — new breaking changes go to `/api/v2/`, never edit a published version
-12. **HTTP status codes follow the convention table** — 201 for POST that creates, 204 for DELETE, 404 for scoped-out resources
-13. **`apiFetch({ responseSchema })` validates every API response client-side** — even your own API, even in dev
-14. **Server state goes through React Query, not `useState`/`useEffect`** — `useState` fetching causes race conditions
-15. **Commit messages: `type: description`** — enforced by commit-msg hook
-16. **Test every handler: happy path + validation-fail + not-found** — minimum 3 cases
-17. **Feature folders: `schema → queries → mutations → handlers → api → hooks → index → components`** — no exceptions
-18. **Cross-feature imports go through `index.ts`** — never deep-import into another feature
-19. **Component filenames are kebab-case** — `home-navbar.tsx`, not `HomeNavbar.tsx`
-20. **No hardcoded color values** — semantic tokens only
-21. **No hardcoded `px` values** — use Tailwind spacing scale
-22. **Use shadcn components, never duplicate them** — extend via `cva` variants
-23. **Rate limit every unauthenticated public route by IP** — applied in middleware for `/api/v1/*`; webhooks exempt
-24. **`page.tsx` files never use `"use client"`** — kills SSR/SEO; extract interactivity into a child component
-25. **Static assets live in `public/`, referenced with absolute paths** — no secrets, no files >1MB
-26. **Use `next/image` for raster images and `next/font` for fonts**
-27. **Every form uses `react-hook-form` + `zodResolver`** — same Zod schema the route handler validates with; submit via `useMutation`, not raw `fetch`
+## Architecture (keep it modular)
+
+- Feature folders: `schema → queries → mutations → handlers → api → hooks → index → components`
+- Cross-feature imports go through `index.ts`. Never deep-import another feature's internals.
+- `handlers.ts` is HTTP-agnostic — never imports `Request`, `NextResponse`, or `headers()`. Pure `(ctx, input) → output`.
+- `route.ts` is a thin adapter: `withApi` → `parseBody` / `parseQuery` → handler → `apiOk` / `apiNoContent`. No business logic, no second `try/catch`.
+- Queries read. Mutations write. Handlers orchestrate. Routes do HTTP. Do not collapse these files.
+- `"use server"` only in `features/auth/actions.ts`. Every other mutation goes through `/api/v1/*`.
+- `page.tsx` / `layout.tsx` never use `"use client"`. Push interactivity into a child.
+- Server components import `queries.ts` directly. Client components use React Query hooks wrapping `api.ts`.
+
+## Errors, logging, observability (four layers — do not mix)
+
+1. **Exceptions:** handlers throw `ApiError` for expected 4xx/429, or a real `Error` for crashes. `withApi` is the only `try/catch` on `/api/v1`.
+2. **HTTP errors:** envelope only — `{ data }` / `{ error: { code, message } }`. Never put `err.message` or a stack in the body. Other users' ids → 404, not 403.
+3. **Logs:** Pino only. `log.<level>({ ...context }, "feature.verb")`. No `console.*`. Use `ctx.log` on `/api/v1` (already bound to `requestId` + `userId`).
+4. **Audit:** `log.info` is not the audit trail. Writes also call `logAudit`. GETs do neither.
+
+- `fatal` = process going down · `error` = this request failed · `warn` = recoverable (expected 4xx, Redis down) · `info` = state change · `debug` = off in prod
+- Honor or mint `x-request-id`; echo it; bind `log.child`. Dual fields: `level` + GCP `severity`.
+- IP is personal data. Store it on `audit_logs` and on `client.error_reported` / `request.error`. Do **not** bind IP on every `log.info`.
+- `/api/health` does `SELECT 1` and returns 503 if the DB is down. Probe this, not `/`.
+- Client errors POST to `/api/log/client-error` (same-origin, Zod, size cap, IP cap).
+
+## API
+
+1. No `any`, no `as` on user input — Zod at every boundary. `safeParse` + `firstError`. Never `.parse()`.
+2. Every `/api/v1` route goes through `withApi` — cookie or Bearer via `requireApiAuth`. Never skip it.
+3. Envelope + status table: 201 create, 204 delete, 404 other users' ids, 409 unique (`23505`), 413 body cap, 415 content-type, 429 + `Retry-After`.
+4. Lists are cursor-paginated (`limit` 1–100). Never unbounded `findMany()`.
+5. `apiFetch({ responseSchema })` is required, even for our own API.
+6. Routes live under `/api/v1/`. Additive fields on v1 are ok; breaking changes go to `/api/v2/`.
+7. `parseBody` / `parseQuery` — never `req.json()` on `/api/v1`.
+8. CORS allowlist only (`CORS_ORIGINS`). Never `*`.
+9. Authenticated responses set `Cache-Control: private, no-store`. Do not CDN-cache or Redis-cache `/api/v1` GET bodies. React Query (`staleTime` + `invalidateQueries` on write) is the client cache. Redis is for **rate limiting only**.
+
+## Auth, secrets, webhooks, rate limit
+
+- API tokens: store SHA-256 hash + display prefix. Compare with `timingSafeEqual`. Never store plaintext.
+- Webhooks: HMAC on the **raw body**, then parse. Idempotent. Not rate-limited (signature is the gate).
+- Rate limit `/api/v1` by IP in middleware (60/min sliding window). Fail **open** if Redis is missing or the limiter throws. Key is IP, never user id alone. `"unknown"` IPs share one bucket.
+- No top-level `throw` for runtime env vars — lazy getter (`getDb()`, `databaseUrl()`). `next build` must import the module.
+- No secret in code, committed env files, or `NEXT_PUBLIC_*`.
+
+## UI, tests, git
+
+- Component filenames are kebab-case. No hardcoded color / px — tokens + Tailwind scale. Use shadcn; never duplicate.
+- Every form: `react-hook-form` + `zodResolver` + `useMutation`.
+- Static assets in `public/`, `next/image`, `next/font`.
+- Test every handler: happy path + validation-fail + not-found. Assert log event names on writes.
+- `APP_ENV` drives source maps (on local/dev, off prod). Not `NODE_ENV`.
+- Commit messages: `type: description` (`feat|fix|docs|style|refactor|test|chore|perf`).
+- Comments explain the code's why, not ticket numbers or rollout sequencing.
 ```
 
 ---
 
 ### 19. CLAUDE.md
 
-Create `CLAUDE.md` at repo root:
+Write `CLAUDE.md` in full. Do not stub. It is the orientation file for coding agents.
 
 ```markdown
 # CLAUDE.md
 
-Auto-loaded by Claude Code. Companion files:
+Auto-loaded by Claude Code. Companion files (read before changing code):
+- [`AGENTS.md`](./AGENTS.md) — router + non-negotiables
 - [`STANDARDS.md`](./STANDARDS.md) — engineering rules
 - [`REVIEW.md`](./REVIEW.md) — review rubric
-- [`AGENTS.md`](./AGENTS.md) — AI review bot entry point
 
----
-
-## Never run git commands — show them instead
-
-Never execute `git add`, `git commit`, `git push`, or any mutating git command. Paste the exact commands for the user to run instead.
+Never commit, push, branch, or open a PR unless the user explicitly asks. Never pass `--no-verify`.
 
 ---
 
 ## Repo orientation
 
-Next.js 16 app with **strict REST APIs and zero server actions** (except the NextAuth sign-in/sign-out forms). Bun = package manager, Node.js = runtime.
+Next.js 16 app with **strict REST APIs**. Bun = package manager, Node.js = runtime. The only `"use server"` file is NextAuth sign-in/sign-out.
 
 | Surface | Where |
 |---|---|
 | Authenticated UI | `src/app/(platform)/` |
-| Public pages (login, terms, privacy) | `src/app/(auth)/`, `src/app/terms`, etc. |
-| **Versioned REST API** | `src/app/api/v1/<resource>/route.ts` |
+| Public pages | `src/app/(auth)/`, `src/app/terms`, `src/app/privacy` |
+| Versioned REST API | `src/app/api/v1/<resource>/route.ts` |
 | Webhooks | `src/app/api/webhooks/<vendor>/route.ts` |
+| Health | `src/app/api/health/route.ts` |
+| Client error ingest | `src/app/api/log/client-error/route.ts` |
 | Business logic | `src/features/<name>/handlers.ts` |
-| DB reads | `src/features/<name>/queries.ts` |
-| DB writes | `src/features/<name>/mutations.ts` |
-| Shared utilities | `src/lib/` |
+| DB reads / writes | `src/features/<name>/queries.ts` / `mutations.ts` |
+| Shared HTTP + log | `src/lib/api/*`, `src/lib/log.ts`, `src/lib/audit.ts` |
 | DB schema | `src/db/schema/` |
 
 ---
 
-## Canonical feature reference
+## Canonical feature (keep this split)
 
-Every feature follows:
-```
-src/features/<name>/
-  schema.ts       ← Zod request + response schemas
-  queries.ts      ← DB reads
-  mutations.ts    ← DB writes
-  handlers.ts     ← (ctx, input) → output; pure business logic
-  api.ts          ← Client-side fetch wrappers
-  hooks/          ← React Query hooks
-  index.ts        ← public barrel
-  components/
-```
+        src/features/<name>/
+          schema.ts       ← Zod request + response
+          queries.ts      ← DB reads (SSR + handlers)
+          mutations.ts    ← DB writes (handlers only)
+          handlers.ts     ← (ctx, input) → output; no HTTP
+          api.ts          ← browser fetch wrappers
+          hooks/          ← React Query
+          index.ts        ← public barrel
+          components/
 
-**The handler/route split is the core architectural decision:**
-- `handlers.ts` is HTTP-agnostic — easy to unit-test, reusable across routes
-- `route.ts` is the HTTP adapter — parses + auths + validates + calls handler
+`route.ts` = `withApi` (auth + one catch + CORS + request id + `Cache-Control: private, no-store`) → `parseBody`/`parseQuery` → handler → `apiOk`.
+`handlers.ts` never imports `Request`, `NextResponse`, or `next/headers`.
+Cross-feature imports go through `index.ts`.
 
-Cross-feature imports go through `index.ts`. Never deep-import.
+---
+
+## Four layers (do not mix)
+
+        throw ApiError / Error  →  withApi catch  →  envelope (user) + log (operator)
+        log.info / warn / error →  stdout JSON. Operators only.
+        logAudit(...)           →  audit_logs. Durable who-did-what.
+
+- Expected failure = `ApiError`. Crash = `Error`. Never leak `err.message` into the HTTP body.
+- On `/api/v1` use `ctx.log`, already bound to `requestId` + `userId`. Signature: `log.<level>({ ...ctx, err }, "feature.verb")`.
+- IP belongs on `audit_logs` and on `client.error_reported` / `request.error`. Not on every `log.info`.
+- Redis is the **rate limiter**, not a response cache. Client cache is React Query (`staleTime` + `invalidateQueries`). Authenticated GET bodies are `private, no-store`.
 
 ---
 
 ## How to... (playbooks)
 
 ### Add a new feature
-```bash
-bun run create-feature <kebab-name>
-```
-Then follow the printed steps: define the DB table, extend `AuditAction`, build the route handlers under `/api/v1/<name>/`, build components.
+
+Run `bun run create-feature <kebab-name>`. Then: DB table, `AuditAction`, `/api/v1/<name>/` routes via `withApi`, components.
 
 ### Add a new API endpoint
-1. Define request + response schemas in `feature/schema.ts`
-2. Write the handler in `feature/handlers.ts` — accepts `(ctx, input)`, returns data or throws `ApiError`
-3. Create `src/app/api/v1/<resource>/route.ts` — the HTTP adapter
-4. Add the typed fetch wrapper in `feature/api.ts`
-5. Add a React Query hook in `feature/hooks/`
-6. Test: handler tests cover business logic, hook tests cover client behavior
+1. Schemas in `feature/schema.ts`
+2. Handler in `feature/handlers.ts` — `(ctx, input)`, throw `ApiError` or return data. `log.info` + `logAudit` on writes.
+3. `src/app/api/v1/<resource>/route.ts` — `withApi` + `parseBody`/`parseQuery` only
+4. Typed wrapper in `feature/api.ts` with `responseSchema`
+5. React Query hook; mutations `invalidateQueries` on success
+6. Tests: happy path + validation-fail + not-found; assert log event names on writes
 
 ### Add a server action
-**Don't.** This scaffold has exactly one server action surface — `features/auth/actions.ts` for sign-in/sign-out. Every other mutation goes through `/api/v1/*`. If you find yourself wanting a server action, you want a route handler instead.
+**Don't.** Only `features/auth/actions.ts` for sign-in/sign-out. Everything else is `/api/v1/*`.
 
 ### Add a DB column or table
 1. Edit `src/db/schema/<table>.ts`
-2. Run `bunx drizzle-kit generate` — commit both the SQL and `drizzle/meta/`
-3. `bunx drizzle-kit migrate` to apply locally
-
-⚠️ Adding `NOT NULL` to a populated table without a default fails on deploy. Make it nullable, backfill, then tighten.
+2. `bunx drizzle-kit generate` — commit SQL **and** `drizzle/meta/`
+3. `bunx drizzle-kit migrate` locally
+Adding `NOT NULL` to a populated table without a default fails on deploy. Nullable → backfill → tighten.
 
 ### Add an env var
-1. Read it via a lazy memoized getter — never top-level `throw` on missing env
-2. Add to `.env.example`
-3. Add to the `REQUIRED` list in `src/instrumentation.ts`
-4. Add to CI workflow's `env:` block
+1. Lazy getter in `src/lib/env.ts` — never throw at import
+2. `.env.example`
+3. `instrumentation.ts` warn-list if required at runtime
+4. CI `env:` block
+Runtime secrets are not `NEXT_PUBLIC_*`. `APP_ENV` is a **build ARG** (`local|dev|prod`); `NODE_ENV` does not drive source maps.
 
 ### Add a webhook handler
-1. Route at `src/app/api/webhooks/<vendor>/route.ts` with `export const runtime = "nodejs"`
-2. Verify signature against the **raw body** before parsing JSON
-3. Make the handler idempotent (webhooks retry)
-4. Skip rate limiting for webhook routes — signature verification is the gate
+1. `src/app/api/webhooks/<vendor>/route.ts` with `runtime = "nodejs"`
+2. HMAC on **raw body** (`req.text()`), then parse, then Zod
+3. Idempotent upsert on event id
+4. Do not rate-limit — signature is the gate
+
+### Rate limit a specific route
+Throw `ApiError(429, "rate_limited", "...", retryAfter)` **inside** `withApi`. Do not add a second catch. Default blunt limit is already IP 60/min on all `/api/v1` in middleware; fail open if Redis is down.
 
 ---
 
-## Gotchas (non-obvious)
+## Gotchas
 
-**`page.tsx` files never use `"use client"`.** Kills SSR/SEO. Extract interactivity into a child component.
-
-**Server components import from `queries.ts` directly, not via the API.** No HTTP roundtrip for SSR. Client components fetch via React Query hooks.
-
-**`handlers.ts` files cannot import `next/headers` or `Request`.** Stay HTTP-agnostic so they're testable without HTTP. Auth context flows in via `ApiContext`.
-
-**API versioning is one-way.** Don't edit `/api/v1/*` once it's published. New breaking changes get a new version directory.
-
-**Response envelope is consistent:** success → `{ data: ... }`, error → `{ error: { code, message } }`. The `apiOk` and `apiError` helpers enforce this — never bypass them.
+- **`page.tsx` is never `"use client"`.** Extract a child.
+- **SSR reads `queries.ts`, not the HTTP API.**
+- **Additive fields on `/api/v1` are ok. Breaking changes go to `/api/v2/`.** Do not silently change a published request/response shape.
+- **Envelope is mandatory.** `apiOk` / `apiError` / `apiNoContent` only.
+- **`getDb()` is lazy.** A top-level `new Pool(process.env.DATABASE_URL)` dies in `next build`.
+- **Do not cache `/api/v1` in Redis or a CDN.** User-scoped JSON will leak across users.
 
 ---
 
@@ -2151,10 +2566,10 @@ Then follow the printed steps: define the DB table, extend `AuditAction`, build 
 | Command | What |
 |---|---|
 | `bun install` | Install deps |
-| `bun run dev` | Start dev server on :3000 |
-| `bun run build` | Production build |
-| `bun run create-feature <name>` | Scaffold a new feature |
-| `bunx vitest run` | Run tests |
+| `bun run dev` | Dev server :3000 |
+| `bun run build` | Production build (`APP_ENV` must be set on the image) |
+| `bun run create-feature <name>` | Scaffold a feature |
+| `bunx vitest run` | Tests |
 | `bunx tsc --noEmit` | Typecheck |
 | `bunx next lint` | ESLint |
 | `bunx drizzle-kit generate` | Generate migration |
@@ -2166,17 +2581,45 @@ Then follow the printed steps: define the DB table, extend `AuditAction`, build 
 
 ### 20. AGENTS.md
 
-Create `AGENTS.md`:
+Write `AGENTS.md` in full. It is the **router**: non-negotiables that apply to every change, plus a map. Detailed rules live in `STANDARDS.md` and `REVIEW.md`.
 
 ```markdown
 # AGENTS.md
 
-Entry point for AI code-review agents.
+## Coding principles
 
-Read these in order:
-1. [`CLAUDE.md`](./CLAUDE.md) — repo orientation
-2. [`STANDARDS.md`](./STANDARDS.md) — engineering rules
-3. [`REVIEW.md`](./REVIEW.md) — full review rubric
+- YAGNI. Prefer the existing helper (`withApi`, `parseBody`, `log`, `logAudit`) over a new abstraction.
+- Comments explain the code's why, not ticket numbers or rollout sequencing.
+
+## Work management
+
+- Never commit, push, branch, or run `gh pr create` / `gh pr merge` unless the user explicitly asks. Never `--no-verify`.
+- Never automatically reply to human review comments on a PR.
+
+**This file is a router.** Read the file named for the task before you write the change.
+
+| Before you… | Read |
+|---|---|
+| Write a route, handler, query, schema, or feature folder | [`STANDARDS.md`](./STANDARDS.md) |
+| Review a diff / self-review before a PR | [`REVIEW.md`](./REVIEW.md) |
+| Orient in the repo / add a feature | [`CLAUDE.md`](./CLAUDE.md) |
+
+---
+
+## Non-negotiables
+
+1. Every `/api/v1` route goes through `withApi`. That is the only `try/catch`. `requireApiAuth` (cookie or Bearer) runs inside it. Never skip it.
+2. Handlers throw `ApiError` for expected failures. Unknown errors become `500 { error: { code: "internal_error", message: "Something went wrong." } }`. Never put `err.message` or a stack in the HTTP body.
+3. `handlers.ts` does not import `Request`, `NextResponse`, or `next/headers`.
+4. `"use server"` only in `features/auth/actions.ts`. Every other mutation is `/api/v1/*`.
+5. Pino only. `log.<level>({ ...context }, "feature.verb")`. No `console.*`. Writes also call `logAudit`. GETs do neither.
+6. Webhooks verify HMAC against the **raw body** before parse. Idempotent.
+7. No secret in code, committed env, or `NEXT_PUBLIC_*`. No module-top-level `throw` on a runtime env var — lazy getter (`getDb()`).
+8. Rate limit `/api/v1` by IP in middleware; fail open if Redis is missing. Redis is **not** a response cache. Authenticated JSON is `Cache-Control: private, no-store`.
+9. IP is personal data: `audit_logs` + client-error / `onRequestError` only. Not on every log line.
+10. Other users' ids → **404**, not 403. Lists are cursor-paginated. CORS allowlist, never `*`.
+11. `APP_ENV` (build ARG) drives source maps. `NODE_ENV` does not.
+12. Feature folders stay split: `schema → queries → mutations → handlers → api → hooks → index → components`. Cross-feature via `index.ts`.
 
 ---
 
@@ -2184,56 +2627,52 @@ Read these in order:
 
 ### 🔴 Block-merge (always raise)
 
-- **`"use server"` outside `features/auth/actions.ts`** — this scaffold is REST-only; every other mutation goes through `/api/v1/*`
-- **Auth bypass** — route handlers that skip `requireAuth()`; middleware bypass-list growth without a self-auth justification
-- **Webhook signature missing** — Stripe / Slack / GitHub webhooks must verify signatures **before** dispatching
-- **Plaintext secret storage** — any new secret column without SHA-256 hashing + `timingSafeEqual` comparison
-- **Module-load throws for runtime env vars** — breaks `next build`'s page-data collection
-- **`NOT NULL` added to a populated table without a default** — fails on deploy
-- **FK violations** — passing non-user UUIDs to `audit_logs.user_id`
-- **Hardcoded secrets in code or committed env files**
-- **Response NOT using `apiOk` / `apiError`** — bypasses the envelope, breaks every client
-- **API route handler missing the try/catch + `apiError(err)` wrapper** — unhandled exceptions leak stack traces
-- **`handlers.ts` importing `Request`, `NextResponse`, or `next/headers`** — handlers must stay HTTP-agnostic
-- **API route response without Zod-typed return shape** — type drift between client expectations and server output
-- **`"use client"` on a `page.tsx` or `layout.tsx`** — kills SSR/SEO
+- **`"use server"` outside `features/auth/actions.ts`**
+- **Auth bypass** — `/api/v1` routes that skip `withApi` / `requireApiAuth`
+- **Second `try/catch` in a route** — stacks leak or get double-logged; `withApi` is the only catch
+- **Webhook `req.json()` before HMAC** — must `req.text()`, verify, then parse
+- **Plaintext secrets** — token columns without SHA-256 + `timingSafeEqual`
+- **Module-load throws for runtime env vars** — breaks `next build`
+- **`NOT NULL` on a populated table without a default**
+- **Hardcoded secrets / committed `.env`**
+- **Envelope bypassed** — not using `apiOk` / `apiError` / `apiNoContent`
+- **`handlers.ts` importing HTTP types**
+- **`"use client"` on `page.tsx` / `layout.tsx`**
+- **Redis or CDN cache of authenticated `/api/v1` GET bodies** — cross-user leak
+- **`Cache-Control: public` on `/api/v1`**
+- **`console.*` in app code** (tests/scripts exempt)
 
 ### 🟡 Discuss / suggest
 
-- Missing `logAudit` on a state-changing handler (reads don't need audit; mutations do)
-- New `AuditAction` value used without adding it to the union in `src/lib/audit.ts`
-- Hardcoded color values (`text-red-500`, `bg-[#1a1a1a]`) — use semantic tokens
-- Hardcoded `px` values (`p-[14px]`, `w-[320px]`) — use Tailwind scale
-- Component filename in PascalCase — should be kebab-case
-- Top-level barrel imports in client/edge code — use sub-path imports
-- `useState` + `useEffect` fetching data — should be React Query
-- Hand-rolled `useState` form state — every form must use `react-hook-form` + `zodResolver`
-- Mutation hook missing `onSuccess: invalidateQueries(...)` — leaves stale cache
-- Route handler returning the wrong HTTP status (e.g. 200 instead of 201 for POST that creates)
+- Missing `logAudit` on a write (reads don't need it)
+- New `AuditAction` not added to the union
+- Missing `invalidateQueries` on mutation success
+- Wrong HTTP status (200 instead of 201/204)
+- IP bound onto every `log.info` — keep it on audit + abuse paths
+- Rate limiter keyed by user id alone
+- Hardcoded color / px; PascalCase component filenames
+- `useState` + `useEffect` fetching; forms without `react-hook-form` + `zodResolver`
 
 ### ⚪ Skip / don't comment
 
-- Style nits auto-fixed by Prettier
-- Theoretical race conditions without a concrete attack path
+- Style nits Prettier fixes
+- Theoretical races without an attack path
 - Missing tests for trivial helpers
-- DoS / resource exhaustion concerns under realistic load
-- Outdated transitive dependencies (handled separately)
-
----
+- DoS / resource exhaustion under realistic load
+- Outdated transitive deps
+- "Add OpenTelemetry / Sentry / Redis response cache" unless the app already has a sink
 
 ## Files to skip entirely
 
 | Path | Reason |
 |---|---|
-| `**/drizzle/0*.sql`, `**/drizzle/meta/**` | Generated by `drizzle-kit` |
+| `**/drizzle/0*.sql`, `**/drizzle/meta/**` | Generated |
 | `bun.lock`, `package-lock.json`, `yarn.lock` | Lockfiles |
 | `**/*.test.ts`, `**/*.test.tsx` | Reviewed by humans |
 | `**/_template/**` | Scaffolding source |
 | `STANDARDS.md`, `CLAUDE.md`, `REVIEW.md`, `AGENTS.md` | Context, not code |
 | `**/.next/**`, `**/dist/**`, `**/build/**` | Build artifacts |
 | `**/public/images/**` | Static assets |
-
----
 
 ## Confidence calibration
 
@@ -2248,14 +2687,14 @@ Read these in order:
 
 ### 21. REVIEW.md
 
-Create `REVIEW.md`:
+Write `REVIEW.md` in full. Bots and humans use this file. Keep it in sync with `AGENTS.md` and `STANDARDS.md`.
 
 ```markdown
 # REVIEW.md
 
 Code-review rubric. Applies to humans and bots.
 
-Read [`CLAUDE.md`](./CLAUDE.md) and [`STANDARDS.md`](./STANDARDS.md) first.
+Read [`CLAUDE.md`](./CLAUDE.md) and [`STANDARDS.md`](./STANDARDS.md) first. `AGENTS.md` is the router.
 
 ---
 
@@ -2263,27 +2702,31 @@ Read [`CLAUDE.md`](./CLAUDE.md) and [`STANDARDS.md`](./STANDARDS.md) first.
 
 ### 🔴 Block-merge
 
-- **`"use server"` outside `features/auth/actions.ts`** — REST-only architecture; mutations belong in `/api/v1/*`
-- **Auth bypass** in route handlers — missing `requireAuth()`
-- **Webhook signature missing** — Stripe / Slack / GitHub
+- **`"use server"` outside `features/auth/actions.ts`**
+- **Auth bypass** — missing `withApi` / `requireApiAuth`
+- **Second `try/catch` in a `/api/v1` route** — `withApi` is the only catch
+- **Webhook signature missing or `req.json()` before verify**
 - **Module-load throws for env vars** — breaks `next build`
-- **`NOT NULL` on a populated table without default** — fails on deploy
+- **`NOT NULL` on a populated table without default**
 - **FK violations** — non-user UUIDs in `audit_logs.user_id`
-- **`apiOk` / `apiError` bypassed** — response envelope broken
-- **Missing try/catch + `apiError(err)` in route handlers** — unhandled exceptions leak stacks
-- **`handlers.ts` importing HTTP types** (`Request`, `NextResponse`, `next/headers`) — handlers must stay pure
-- **`"use client"` on a `page.tsx` / `layout.tsx`** — kills SSR/SEO
+- **`apiOk` / `apiError` / `apiNoContent` bypassed**
+- **`handlers.ts` importing HTTP types**
+- **`"use client"` on `page.tsx` / `layout.tsx`**
+- **Plaintext token/secret storage**
+- **Redis/CDN cache of authenticated `/api/v1` GET bodies**, or `Cache-Control: public` on `/api/v1`
+- **`err.message` / stack in an HTTP error body**
+- **`console.*` in app code**
 
 ### 🟡 Discuss
 
-- Missing `revalidateQueries` on mutation success — leaves stale React Query cache
-- Missing `logAudit` on a state-changing handler
+- Missing `invalidateQueries` on mutation success
+- Missing `logAudit` on a write
 - New `AuditAction` not added to the union
-- Wrong HTTP status code (e.g. 200 for POST that created — should be 201)
-- Hardcoded color/px values — use tokens / Tailwind scale
-- Component filename in PascalCase — should be kebab-case
-- `useState` + `useEffect` data fetching — should be React Query
-- Form without `react-hook-form` + `zodResolver`
+- Wrong HTTP status (200 for create; body on 204)
+- IP on every log line (keep it on audit + abuse paths)
+- Rate limit keyed by user id alone; fail-closed when Redis is unset
+- Hardcoded color/px; PascalCase filenames
+- `useState` + `useEffect` fetching; form without `react-hook-form` + `zodResolver`
 - Native `confirm()` / `alert()` — use shadcn `Dialog`
 - Duplicate shadcn components — extend via `cva`
 
@@ -2292,8 +2735,9 @@ Read [`CLAUDE.md`](./CLAUDE.md) and [`STANDARDS.md`](./STANDARDS.md) first.
 - Auto-fixable style nits
 - Theoretical race conditions
 - Missing tests for trivial helpers
-- DoS / resource exhaustion concerns
+- DoS / resource exhaustion
 - Outdated transitive deps
+- "Add Sentry / OpenTelemetry / Redis response cache" with no sink in this repo
 
 ### Files to skip entirely
 
@@ -2332,16 +2776,35 @@ When a PR touches `/api/v1/`:
 
 ### 🔴 Block-merge
 
-- **Changing the response shape of a published endpoint** — that's a v2, not a v1 patch
-- **Changing the request body shape required by a published endpoint** — same; goes in v2
-- **Removing an endpoint** — deprecate first, remove later
-- **Wrong status code** — POST that creates must return 201, not 200; DELETE returns 204
+- **Breaking a published request/response shape** — additive fields on v1 are ok; breaking changes go to `/api/v2/`
+- **Removing an endpoint** — deprecate first
+- **Wrong status** — POST create = 201, DELETE = 204, other users' ids = 404
+- **Skipping `withApi` / `parseBody`**
+- **Returning internals** (`err.message`, stack) in the envelope
+- **Missing `x-request-id` or `Cache-Control: private, no-store`**
 
 ### 🟡 Discuss
 
-- Adding an optional field to a response — fine, but document
+- Adding an optional response field — fine, document
 - Adding a new endpoint under an existing resource — fine
-- Loosening request validation — usually fine but worth a sanity check
+- Loosening request validation
+- Per-route tighter rate limit (throw `ApiError(429)` inside `withApi`)
+
+---
+
+## Logging / observability PR rubric
+
+### 🔴 Block-merge
+
+- `console.*` in app code
+- Missing `{ err }` on a failure log (loses stack)
+- Logging `authorization`, cookies, tokens, or plaintext secrets
+
+### 🟡 Discuss
+
+- Event name not `feature.verb`
+- Write without `log.info` + `logAudit`
+- IP added to the default `withApi` child logger
 
 ---
 
@@ -2372,7 +2835,9 @@ Create `.github/pull_request_template.md`:
 - [ ] Followed [STANDARDS.md](../STANDARDS.md)
 - [ ] Tests pass locally (`bunx vitest run`)
 - [ ] Typecheck + lint pass (`bunx tsc --noEmit`, `bunx next lint`)
-- [ ] If touching `/api/v1/*`: response shape is unchanged for existing endpoints
+- [ ] If touching `/api/v1/*`: went through `withApi`; envelope unchanged for existing endpoints; writes have `log.info` + `logAudit`
+- [ ] If adding a webhook: HMAC on raw body, then parse; idempotent
+- [ ] No secrets in code / `NEXT_PUBLIC_*`; no module-top-level env throws
 
 ## Test plan
 
@@ -2385,17 +2850,20 @@ Create `.github/pull_request_template.md`:
 
 ### 23. `next.config.ts`
 
+`APP_ENV` is a **build ARG** (`local` | `dev` | `prod`). Unset/garbage → `local`. Prod keeps source maps **off**.
 ```typescript
 import type { NextConfig } from "next";
+import { ENVIRONMENT_SETTINGS, appEnvironment } from "./src/lib/app-environment";
+
+const environment = ENVIRONMENT_SETTINGS[appEnvironment(process.env.APP_ENV)];
 
 const nextConfig: NextConfig = {
   output: "standalone",
+  productionBrowserSourceMaps: environment.enableBrowserSourceMaps,
   serverExternalPackages: ["pg", "pino"],
   transpilePackages: [],
   images: {
-    remotePatterns: [
-      { protocol: "https", hostname: "lh3.googleusercontent.com" },
-    ],
+    remotePatterns: [{ protocol: "https", hostname: "lh3.googleusercontent.com" }],
   },
   async headers() {
     return [
@@ -2423,38 +2891,13 @@ export default nextConfig;
 export async function register(): Promise<void> {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
 
+  const { attachProcessHandlers } = await import("./lib/process-handlers");
+  attachProcessHandlers();
+
   const { log } = await import("./lib/log");
-
-  process.on("uncaughtException", (err) => {
-    log.fatal({ err }, "process.uncaught_exception");
-    process.exit(1);
-  });
-
-  process.on("unhandledRejection", (reason) => {
-    log.fatal({ reason }, "process.unhandled_rejection");
-  });
-
-  process.on("SIGTERM", () => {
-    log.info("process.sigterm — shutting down");
-    process.exit(0);
-  });
-
-  const REQUIRED = [
-    "DATABASE_URL",
-    "AUTH_SECRET",
-    "AUTH_GOOGLE_ID",
-    "AUTH_GOOGLE_SECRET",
-    "NEXT_PUBLIC_APP_URL",
-    "UPSTASH_REDIS_REST_URL",
-    "UPSTASH_REDIS_REST_TOKEN",
-    "GMAIL_USER",
-    "GMAIL_APP_PASSWORD",
-  ];
-
-  for (const key of REQUIRED) {
-    if (!process.env[key]) {
-      log.error({ key }, `instrumentation.missing_env — ${key} is not set`);
-    }
+  const required = ["DATABASE_URL", "AUTH_SECRET", "NEXT_PUBLIC_APP_URL"] as const;
+  for (const key of required) {
+    if (!process.env[key]) log.warn({ key }, "instrumentation.missing_env");
   }
 }
 
@@ -2470,13 +2913,12 @@ export async function onRequestError(
   const { log } = await import("./lib/log");
   const error = err instanceof Error ? err : new Error(String(err));
   const digest = (error as Error & { digest?: string }).digest;
-
   const xff = request.headers["x-forwarded-for"];
   const ip = xff?.split(",")[0]?.trim() ?? request.headers["x-real-ip"] ?? null;
-
   log.error(
     {
-      err: error, digest,
+      err: error,
+      digest,
       request: { path: request.path, method: request.method, ip },
       route: { kind: context.routerKind, path: context.routePath, type: context.routeType },
     },
@@ -2570,58 +3012,41 @@ IP-based sliding window using Upstash Redis. Applied in middleware for the whole
 3. Plan: **Free** (10,000 req/day) for dev; **Pay as you go** for prod
 4. Go to **REST API** tab → copy both values into `.env.local`
 
-**`src/lib/rate-limit.ts`:**
+**`src/lib/rate-limit.ts`** — lazy Redis. Missing Upstash → fail **open** + `log.warn`. Never `Redis.fromEnv()` at import (`next build` would die).
 ```typescript
 import { Ratelimit } from "@upstash/ratelimit";
 import { Redis } from "@upstash/redis";
+import { log } from "@/lib/log";
 
-const redis = Redis.fromEnv();
+export type RateLimitResult = { allowed: true } | { allowed: false; retryAfter: number };
 
-export type RateLimitResult =
-  | { allowed: true }
-  | { allowed: false; retryAfter: number };
+function getRedis(): Redis | null {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+  return new Redis({ url, token });
+}
 
 export function createRateLimiter(config: { windowMs: number; max: number }) {
-  const limiter = new Ratelimit({
-    redis,
-    limiter: Ratelimit.slidingWindow(config.max, `${config.windowMs}ms`),
-    prefix: `rl:${config.windowMs}:${config.max}`,
-  });
-
   return async function check(ip: string): Promise<RateLimitResult> {
-    const { success, reset } = await limiter.limit(ip);
-    if (!success) {
-      return { allowed: false, retryAfter: Math.ceil((reset - Date.now()) / 1000) };
+    const redis = getRedis();
+    if (!redis) {
+      log.warn({}, "ratelimit.disabled_no_redis");
+      return { allowed: true };
     }
+    const limiter = new Ratelimit({
+      redis,
+      limiter: Ratelimit.slidingWindow(config.max, `${config.windowMs}ms`),
+      prefix: `rl:${config.windowMs}:${config.max}`,
+    });
+    const { success, reset } = await limiter.limit(ip);
+    if (!success) return { allowed: false, retryAfter: Math.ceil((reset - Date.now()) / 1000) };
     return { allowed: true };
   };
 }
 ```
 
-**Usage — tighter per-route limit on top of the middleware's broad one:**
-```typescript
-// src/app/api/v1/contact/route.ts
-import type { NextRequest } from "next/server";
-import { apiOk, apiError } from "@/lib/api/response";
-import { ApiError } from "@/lib/api/errors";
-import { createRateLimiter } from "@/lib/rate-limit";
-import { getIp } from "@/lib/get-ip";
-
-const contactLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 5 });
-
-export async function POST(req: NextRequest) {
-  try {
-    const rl = await contactLimiter(getIp(req));
-    if (!rl.allowed) {
-      throw new ApiError(429, "rate_limited", "Too many requests. Please try again later.");
-    }
-    // ... rest of handler
-    return apiOk({});
-  } catch (err) {
-    return apiError(err);
-  }
-}
-```
+Per-route tighter limit — throw `ApiError(429, "rate_limited", "...", retryAfter)` **inside** `withApi` so `Retry-After` is set. Do not add a second try/catch.
 
 **Sensible defaults:**
 
@@ -2637,6 +3062,69 @@ export async function POST(req: NextRequest) {
 - Apply to every public route — webhooks are exempt (signature verification is their gate)
 - Always return `Retry-After` header — clients respect it
 - `"unknown"` IPs share one bucket — intentional safe fallback
+
+---
+
+### 26b. Webhooks — raw body, then parse
+
+Canonical handler. Copy this; swap the header name for Stripe/GitHub/Slack. **Never** `req.json()` before verify.
+
+**`src/lib/webhook.ts`:**
+```typescript
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { ApiError } from "@/lib/api/errors";
+import { webhookSecret } from "@/lib/env";
+
+export function verifyHmacSha256(rawBody: string, header: string | null): void {
+  const secret = webhookSecret();
+  if (!secret) throw new ApiError(500, "internal_error", "Webhook is not configured.");
+  if (!header) throw new ApiError(401, "unauthorized", "Missing signature.");
+  const digest = createHmac("sha256", secret).update(rawBody).digest("hex");
+  const a = Buffer.from(digest);
+  const b = Buffer.from(header);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
+    throw new ApiError(401, "unauthorized", "Invalid signature.");
+  }
+}
+```
+
+**`src/app/api/webhooks/stripe/route.ts`** (generic HMAC; rename header when you wire a vendor):
+```typescript
+import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
+import { log } from "@/lib/log";
+import { verifyHmacSha256 } from "@/lib/webhook";
+
+export const runtime = "nodejs";
+
+const EventSchema = z.object({
+  id: z.string().max(200),
+  type: z.string().max(100),
+});
+
+export async function POST(req: NextRequest) {
+  const raw = await req.text();
+  try {
+    verifyHmacSha256(raw, req.headers.get("x-webhook-signature"));
+  } catch (err) {
+    log.warn({ err }, "webhooks.signature_rejected");
+    return NextResponse.json({ error: { code: "unauthorized", message: "Invalid signature." } }, { status: 401 });
+  }
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    return NextResponse.json({ error: { code: "bad_request", message: "Invalid payload." } }, { status: 400 });
+  }
+  const parsed = EventSchema.safeParse(json);
+  if (!parsed.success) {
+    return NextResponse.json({ error: { code: "bad_request", message: "Invalid payload." } }, { status: 400 });
+  }
+  // Idempotent: upsert on parsed.data.id, then return 200 even on retries.
+  log.info({ eventId: parsed.data.id, type: parsed.data.type }, "webhooks.received");
+  return NextResponse.json({ received: true });
+}
+```
 
 ---
 
@@ -3050,28 +3538,22 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-ARG DATABASE_URL
-ARG AUTH_SECRET
-ARG AUTH_GOOGLE_ID
-ARG AUTH_GOOGLE_SECRET
+ARG APP_ENV=dev
 ARG NEXT_PUBLIC_APP_URL
-ARG UPSTASH_REDIS_REST_URL
-ARG UPSTASH_REDIS_REST_TOKEN
-ENV DATABASE_URL=${DATABASE_URL}
-ENV AUTH_SECRET=${AUTH_SECRET}
-ENV AUTH_GOOGLE_ID=${AUTH_GOOGLE_ID}
-ENV AUTH_GOOGLE_SECRET=${AUTH_GOOGLE_SECRET}
-ENV NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
-ENV UPSTASH_REDIS_REST_URL=${UPSTASH_REDIS_REST_URL}
-ENV UPSTASH_REDIS_REST_TOKEN=${UPSTASH_REDIS_REST_TOKEN}
+ENV APP_ENV=$APP_ENV
+ENV NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL
 ENV NEXT_TELEMETRY_DISABLED=1
 
 RUN bun run build
 
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
+ARG APP_ENV=dev
+ENV APP_ENV=$APP_ENV
+ARG NEXT_PUBLIC_APP_URL
+ENV NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL
 
 RUN addgroup -S nodejs && adduser -S nextjs -G nodejs
 
@@ -3098,7 +3580,6 @@ node_modules
 .idea
 .DS_Store
 *.log
-*.lock
 *.tsbuildinfo
 .env
 .env.local
@@ -3123,9 +3604,6 @@ Thumbs.db
 .env.production
 .env*.local
 
-# Drizzle
-drizzle/meta/
-
 # Build output
 .next/
 out/
@@ -3149,7 +3627,9 @@ bunx vitest run
 bunx next build
 ```
 
-All should pass before the first commit.
+All should pass before the first commit. `next build` must succeed with dummy `DATABASE_URL` (lazy `getDb()`). Confirm `productionBrowserSourceMaps` is false when `APP_ENV=prod`.
+
+**Post-scaffold (human, not the model):** Neon project, Google OAuth client, Upstash Redis, Vercel tokens, optional tweakcn theme, `WEBHOOK_SECRET` when you add a vendor.
 
 First commit:
 ```bash
@@ -3166,34 +3646,28 @@ git commit -m "chore: initial project setup"
 | Bun package manager | Fast installs, Vitest integration. Next.js runtime stays Node.js |
 | Husky hooks | Format, lint, types, tests, audit on every push |
 | Conventional commits | Enforced by commit-msg hook |
-| shadcn/ui + tweakcn theme | CSS variables, no hardcoded colors |
-| Drizzle + NeonDB | Schema-first migrations, pooled URL for app, direct URL for migrations |
-| NextAuth v5 + Google | Sign-in / sign-out via the only `"use server"` file in the codebase |
-| **REST API + zero server actions** | Every mutation goes through `/api/v1/*` |
-| **`handlers.ts` / `route.ts` split** | Pure business logic + thin HTTP adapter |
-| **Response envelope** | `{ data: ... }` / `{ error: { code, message } }` everywhere via `apiOk` / `apiError` |
-| **API versioning** | `/api/v1/`, never edit a published version |
-| **HTTP status conventions** | 201 for POST creates, 204 for DELETE, 404 for scoped-out, etc. |
-| `apiFetch` client | Typed fetch wrapper with Zod response validation |
-| Zod conventions | One schema, two consumers — `safeParse` on server, `zodResolver` on client |
-| Forms | `react-hook-form` + `zodResolver` + `useMutation` — no inline `useState` |
-| React Query | Server state with cache, no `useState`/`useEffect` fetching |
+| shadcn/ui | CSS variables, no hardcoded colors (tweakcn optional later) |
+| Drizzle + Postgres | Lazy `getDb()`, TLS verify on, pooled URL for app, direct URL for migrations |
+| NextAuth v5 + Google | JWT sessions; adapter only for users/accounts. Sign-in/out is the only `"use server"` |
+| **REST `/api/v1` + `withApi`** | Cookie **or** Bearer. One catch. Envelope + request id + CORS + `private, no-store` |
+| **Cursor pagination** | `{ items, next_cursor }`, limit 1–100 |
+| **Webhooks** | HMAC on **raw body**, then parse; idempotent |
+| Pino logger | JSON + GCP severity, `APP_LOG_FILE` sidecar, redaction, `no-console` |
+| Client errors | Same-origin, Zod, rate-limited `/api/log/client-error` |
+| Source maps | `APP_ENV` build ARG — on local/dev, **off prod** |
+| Audit trail | `log.info` + `logAudit` on every write including PATCH. IP on audit, not every log line |
+| Rate limit | IP middleware; Redis for this only; fail open if Redis missing. No Redis response cache |
+| Client cache | React Query `staleTime` + `invalidateQueries` on write |
+| Governance docs | `CLAUDE.md` (orient) · `AGENTS.md` (router) · `STANDARDS.md` (rules) · `REVIEW.md` (rubric) — written in full |
+| Dockerfile | Bun→Node 22, `APP_ENV` + `NEXT_PUBLIC_*` only at build — no secrets in the image |
+| `apiFetch` client | Typed fetch + required `responseSchema`; cookie or Bearer |
+| Zod at every boundary | One schema, two consumers — `safeParse` on server, `zodResolver` on client |
+| Forms | `react-hook-form` + `zodResolver` + `useMutation` |
 | Feature template | `schema → queries → mutations → handlers → api → hooks → index → components` |
-| `bun run create-feature` | Scaffolder copies template, replaces tokens, prints next steps |
-| Pino logger | Structured JSON, GCP-severity compatible, secret redaction |
-| Client error reporting | `/api/log/client-error` + `reportClientError()` |
-| Audit trail | Every state-changing handler calls `logAudit` |
-| Upstash Redis | Serverless Redis for rate limiting — IP-based, applied in middleware |
-| Vitest + mock builders | Handler tests, hook tests, schema tests — 3-case minimum |
-| Styling conventions | Kebab-case files, no hardcoded px/colors, mobile-first |
-| `next.config.ts` | `standalone` output, `serverExternalPackages`, security headers |
-| `instrumentation.ts` | Startup env validation + global `onRequestError` capture |
+| Vitest | Handler + hook + schema tests — 3-case minimum |
+| `instrumentation.ts` | Env at first use + `onRequestError` |
 | Error/loading pages | `error.tsx`, `global-error.tsx`, `not-found.tsx`, `loading.tsx` |
-| SEO | `sitemap.ts`, `robots.ts`, OG image conventions, per-page metadata |
-| Governance docs | `CLAUDE.md`, `STANDARDS.md`, `AGENTS.md`, `REVIEW.md`, PR template |
-| Email | Nodemailer + Gmail SMTP via App Password |
-| Vercel deploy | GitHub Actions workflow + `vercel.json` disabling auto-deploy |
-| Dockerfile | Multi-stage Bun→Node build for non-Vercel hosts |
-| CI workflow | Parallel lint/format/typecheck/audit/test jobs |
+| Governance docs | `CLAUDE.md`, `STANDARDS.md`, `AGENTS.md`, `REVIEW.md` |
+| CI | Parallel lint / format / typecheck / audit / test |
 
 ## PROMPT END

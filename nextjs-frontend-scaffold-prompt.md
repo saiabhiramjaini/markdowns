@@ -3,15 +3,67 @@
 Copy-paste this entire prompt to scaffold a production-ready **frontend-only** Next.js app from scratch.
 Replace `{{APP_NAME}}` with your app name (kebab-case, e.g. `my-app`).
 
-**Use this when:** the app has no database, no server-side mutations, no auth on the server. The frontend may call an external API you don't control (Stripe public endpoints, public REST APIs, your own backend on a different service), or it may be purely static (marketing, docs, landing pages).
+**Use this when:** the app has no first-party database, no NextAuth, no server-side mutations. It may call an **external** API you do not control, or be purely static (marketing, docs, landing).
 
-**Use the full-stack prompt instead when:** you need a database, NextAuth + Google OAuth, server actions, audit trails, or any first-party backend logic.
+**Use the server-actions prompt instead when:** you need Postgres, NextAuth, and mutations in this Next app.
+
+**Use the REST `/api/v1` prompt instead when:** this Next app *is* the API for mobile / third-party clients.
 
 ---
 
 ## PROMPT START
 
 Scaffold a production-ready frontend-only Next.js app called `{{APP_NAME}}`. Follow every instruction exactly — don't add extras, don't skip steps.
+
+Non-interactive CLIs only: `bunx shadcn@latest init -d`. Do not open tweakcn / Vercel in a browser. Ship a default `globals.css` token set (shadcn Slate + CSS variables).
+
+**Write `CLAUDE.md`, `AGENTS.md`, `STANDARDS.md`, and `REVIEW.md` in full from the templates in this prompt.** Do not stub. They must match §0. Do **not** add Sentry, PostHog, Redis, NextAuth, Drizzle, or a response cache.
+
+---
+
+### 0. Exception handling, errors, logging, observability (read first)
+
+Three layers (there is no audit table and no first-party API). Do not mix them.
+
+```
+thrown Error in SSR / route     →   onRequestError + generic UI
+external API fail / Zod drift   →   user-safe toast + log.error
+log.info / warn / error         →   stdout JSON. Operators only.
+reportClientError(...)          →   POST /api/log/client-error → same Pino line
+```
+
+**Exceptions**
+
+- Server components and the few routes (`/api/health`, `/api/log/client-error`, optional `/api/contact`) must not leak `err.message` or stacks to the browser.
+- `error.tsx` shows a generic message + `digest`. `reportClientError` sends the stack to the server log.
+- Process: `uncaughtException` → `log.fatal` in Node-only `process-handlers.ts` (not inside `instrumentation.ts`). `unhandledRejection` → `log.error`.
+
+**Error handling (what the user sees)**
+
+- Forms: Zod via `zodResolver` + `toast.error` / `form.setError`. Never a raw fetch error string.
+- External API: `apiFetch` `safeParse`s the response. Drift → `ApiError` / toast, not a crash three components down.
+- No `"use server"` mutations. If you need those, you picked the wrong prompt.
+
+**Logging**
+
+Pino only on the server. `console.*` is an ESLint error in app code. Signature: `log.<level>({ ...context }, "feature.verb")`.
+
+| Level | When |
+|---|---|
+| `fatal` | Process is going down |
+| `error` | SSR / route / external fetch actually failed; client error reported |
+| `warn` | Recoverable |
+| `info` | Rare on a frontend-only app (contact submitted) |
+| `debug` | Off in prod unless `LOG_LEVEL=debug` |
+
+IP on `client.error_reported` / `request.error` only — not on every line. React Query is the client cache (`staleTime` + `invalidateQueries`). Do not add Redis.
+
+**Observability**
+
+- Dual fields: `level` + GCP `severity`. `service` from `DD_SERVICE`.
+- `APP_ENV=local|dev|prod` is a **build ARG**. Browser source maps on local/dev, **off prod**.
+- `/api/health` returns `{ ok: true }` (no DB). Probe this, not `/`.
+- Do not add Sentry or PostHog until a DSN/key exists.
 
 ---
 
@@ -87,24 +139,19 @@ Add to root `package.json`:
 
 ### 3. shadcn/ui + theme
 
-**Step 1 — Init shadcn:**
+**Step 1 — Init shadcn (non-interactive):**
 ```bash
-bunx shadcn@latest init
+bunx shadcn@latest init -d
 ```
 
-When prompted:
-- Style: **Default**
-- Base color: **Slate**
-- CSS variables: **Yes**
+Defaults (Default style, Neutral/Slate, CSS variables) are fine. Do not wait for a TTY.
 
 **Step 2 — Add the base component set:**
 ```bash
 bunx shadcn@latest add button input label textarea dialog dropdown-menu badge toast card separator skeleton tabs select checkbox radio-group switch tooltip popover sheet command avatar form
 ```
 
-**Step 3 — Get `globals.css` from tweakcn.com:**
-
-Go to [tweakcn.com](https://tweakcn.com) → pick a theme → copy the generated CSS → replace the contents of `src/app/globals.css` entirely with what tweakcn gives you.
+**Step 3 — Theme:** keep the shadcn `globals.css` token set. Optionally replace later from tweakcn.com — not part of codegen.
 
 **Rules:**
 - Always install via `bunx shadcn@latest add <name>` — never copy-paste manually
@@ -224,13 +271,18 @@ const baseOptions: LoggerOptions = {
       return { level: label, severity: PINO_TO_SEVERITY[label] ?? label.toUpperCase() };
     },
     bindings() {
-      return { service: "{{APP_NAME}}" };
+      return { service: process.env.DD_SERVICE ?? "{{APP_NAME}}" };
     },
   },
   timestamp: pino.stdTimeFunctions.isoTime,
   redact: {
-    paths: ["password", "*.password", "token", "*.token", "apiKey", "*.apiKey", "authorization", "*.authorization"],
+    paths: [
+      "password", "*.password", "token", "*.token",
+      "apiKey", "*.apiKey", "authorization", "*.authorization",
+      "headers.authorization", "headers.cookie",
+    ],
     censor: "[REDACTED]",
+    remove: false,
   },
 };
 
@@ -239,35 +291,145 @@ const devTransport: LoggerOptions["transport"] =
     ? { target: "pino-pretty", options: { colorize: true, translateTime: "SYS:HH:MM:ss.l", ignore: "pid,hostname,service,severity" } }
     : undefined;
 
-export const log: Logger = pino({ ...baseOptions, ...(devTransport ? { transport: devTransport } : {}) });
+function buildDestination(): pino.DestinationStream | undefined {
+  const appLogFile = process.env.APP_LOG_FILE;
+  if (!appLogFile || devTransport) return undefined;
+  try {
+    const fileStream = pino.destination({ dest: appLogFile, mkdir: true, sync: false });
+    fileStream.on("error", () => {});
+    return pino.multistream([
+      { stream: pino.destination({ dest: 1, sync: false }) },
+      { stream: fileStream },
+    ]);
+  } catch (err) {
+    process.stderr.write(
+      `[log] APP_LOG_FILE unusable, stdout only: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+    return undefined;
+  }
+}
+
+const destination = buildDestination();
+
+export const log: Logger = devTransport
+  ? pino({ ...baseOptions, transport: devTransport })
+  : destination
+    ? pino(baseOptions, destination)
+    : pino(baseOptions);
+```
+
+**`src/lib/app-environment.ts`:**
+```typescript
+export const APP_ENVIRONMENTS = ["local", "dev", "prod"] as const;
+export type AppEnvironment = (typeof APP_ENVIRONMENTS)[number];
+export type EnvironmentSettings = { enableBrowserSourceMaps: boolean };
+export const ENVIRONMENT_SETTINGS: Record<AppEnvironment, EnvironmentSettings> = {
+  local: { enableBrowserSourceMaps: true },
+  dev: { enableBrowserSourceMaps: true },
+  prod: { enableBrowserSourceMaps: false },
+};
+export function appEnvironment(value: string | undefined): AppEnvironment {
+  return APP_ENVIRONMENTS.includes(value as AppEnvironment) ? (value as AppEnvironment) : "local";
+}
+```
+
+**`src/lib/get-ip.ts`:**
+```typescript
+import type { NextRequest } from "next/server";
+export function getIp(req: NextRequest): string {
+  return (
+    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
+    req.headers.get("x-real-ip") ??
+    "unknown"
+  );
+}
+```
+
+**`src/lib/process-handlers.ts`** — Node-only. Not in `instrumentation.ts`.
+```typescript
+import { log } from "./log";
+export function attachProcessHandlers(): void {
+  if ((globalThis as { __processHandlers?: boolean }).__processHandlers) return;
+  (globalThis as { __processHandlers?: boolean }).__processHandlers = true;
+  process.on("uncaughtException", (err) => {
+    log.fatal({ err }, "process.uncaught_exception");
+  });
+  process.on("unhandledRejection", (reason) => {
+    log.error(
+      { err: reason instanceof Error ? reason : new Error(String(reason)) },
+      "process.unhandled_rejection"
+    );
+  });
+}
 ```
 
 **`src/lib/report-client-error.ts`** — for client-component errors:
 ```typescript
-export function reportClientError(err: unknown, context?: Record<string, unknown>): void {
+export function reportClientError(err: unknown, source = "unknown"): void {
+  if (typeof window === "undefined") return;
   const message = err instanceof Error ? err.message : String(err);
   const stack = err instanceof Error ? err.stack : undefined;
   fetch("/api/log/client-error", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ message, stack, context }),
+    body: JSON.stringify({
+      message: message.slice(0, 2_000),
+      stack: stack?.slice(0, 8_000),
+      source: typeof source === "string" ? source.slice(0, 50) : "unknown",
+      url: window.location.href.slice(0, 2_000),
+    }),
+    keepalive: true,
+    credentials: "same-origin",
   }).catch(() => {});
 }
 ```
 
-**`src/app/api/log/client-error/route.ts`** — receives client errors and forwards to your log backend (Cloud Run / Vercel logs / wherever pino's JSON ships):
+**`src/app/api/log/client-error/route.ts`** — same-origin, Zod, size cap, in-memory IP cap:
 ```typescript
 import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
 import { log } from "@/lib/log";
+import { getIp } from "@/lib/get-ip";
 
 export const runtime = "nodejs";
 
+const Schema = z.object({
+  message: z.string().min(1).max(2_000),
+  stack: z.string().max(8_000).optional(),
+  source: z.string().min(1).max(50),
+  url: z.string().max(2_000).optional(),
+});
+
+const buckets = new Map<string, { count: number; resetAt: number }>();
+function allow(ip: string): boolean {
+  const now = Date.now();
+  const b = buckets.get(ip);
+  if (!b || b.resetAt <= now) {
+    buckets.set(ip, { count: 1, resetAt: now + 60_000 });
+    return true;
+  }
+  if (b.count >= 10) return false;
+  b.count += 1;
+  return true;
+}
+
 export async function POST(req: NextRequest): Promise<NextResponse> {
-  try {
-    const body = await req.json();
-    log.error({ ...body, source: "client" }, "client.error");
-  } catch {}
-  return NextResponse.json({ ok: true });
+  const origin = req.headers.get("origin");
+  const app = process.env.NEXT_PUBLIC_APP_URL;
+  if (origin && app && origin !== new URL(app).origin) {
+    return new NextResponse(null, { status: 204 });
+  }
+  if (Number(req.headers.get("content-length") ?? 0) > 12_000) {
+    return new NextResponse(null, { status: 413 });
+  }
+  const ip = getIp(req);
+  if (!allow(ip)) return new NextResponse(null, { status: 429 });
+  const parsed = Schema.safeParse(await req.json().catch(() => null));
+  if (!parsed.success) return new NextResponse(null, { status: 400 });
+  const err = new Error(parsed.data.message);
+  if (parsed.data.stack) err.stack = parsed.data.stack;
+  log.error({ err, source: parsed.data.source, client: { url: parsed.data.url, ip } }, "client.error_reported");
+  return new NextResponse(null, { status: 204 });
 }
 ```
 
@@ -696,6 +858,9 @@ src/
     api/
       client.ts
     log.ts
+    app-environment.ts
+    process-handlers.ts
+    get-ip.ts
     report-client-error.ts
     utils.ts
     store/
@@ -773,12 +938,13 @@ Create `.env.example`:
 ```bash
 # App URL (used for canonical metadataBase, sitemap, robots)
 NEXT_PUBLIC_APP_URL=http://localhost:3000
+APP_ENV=local
+LOG_LEVEL=debug
+DD_SERVICE={{APP_NAME}}
+# APP_LOG_FILE=/shared-volume/logs/app.log
 
 # External API (skip if purely static)
 NEXT_PUBLIC_API_URL=https://api.example.com
-
-# Logging
-LOG_LEVEL=debug
 ```
 
 Create `.env.local` from `.env.example`.
@@ -937,243 +1103,154 @@ try {
 
 ### 18. STANDARDS.md
 
-Create `STANDARDS.md`:
+Write `STANDARDS.md` in full. Do not stub.
 
 ```markdown
 # STANDARDS.md
 
-The engineering rules for this repo. Every code change should satisfy them.
+## Architecture
 
-1. **No `any`, no `as` casts on user input** — validate with Zod at every boundary
-2. **`safeParse` everywhere, `firstError` for the user message** — never `.parse()`
-3. **No `console.log` server-side** — use `log` from `@/lib/log`
-4. **No `console.error` client-side** — use `reportClientError()` + `toast.error()`
-5. **Validate every external API response with Zod** — they can change shape without warning
-6. **Commit messages: `type: description`** — enforced by commit-msg hook
-7. **Feature folders: `components → hooks → schema → api → index`** — no exceptions
-8. **Cross-feature imports go through `index.ts`** — never deep-import into another feature
-9. **`"use server"` only at the top of files, never inline** — extract into a dedicated file
-10. **`page.tsx` files never use `"use client"`** — pages stay server components for SSR/SEO. Extract interactivity into child components
-11. **Component filenames are kebab-case** — `home-navbar.tsx`, not `HomeNavbar.tsx`
-12. **No hardcoded color values** — use semantic tokens only (`bg-background`, `text-muted-foreground`)
-13. **No hardcoded `px` values** — use Tailwind spacing scale
-14. **Use shadcn components, never duplicate them** — extend via `cva` variants
-15. **Every form uses `react-hook-form` + `zodResolver`** — same Zod schema as the API request validation
-16. **Server state goes through React Query, not `useState`/`useEffect`** — `useState` fetching causes race conditions
-17. **Client state goes through Zustand** — one store per concern, not a god store
-18. **Static assets live in `public/`, referenced with absolute paths** — `/logo.png` not `./logo.png`. No secrets, no files >1MB
-19. **Use `next/image` for raster images and `next/font` for fonts** — never `<img>` or self-hosted font files
-20. **Test schemas, hooks, and key components** — happy path + error path minimum
+- Feature folders: `schema → api → hooks → index → components`. Zustand stores live in `src/lib/store/` or the feature.
+- Cross-feature imports go through `index.ts`.
+- No first-party DB, NextAuth, Redis, or `"use server"` mutations. If you need those, you picked the wrong prompt.
+- `page.tsx` / `layout.tsx` never `"use client"`.
+- Server state: React Query. Client UI state: Zustand. Never `useState`+`useEffect` fetching.
+- External API responses: Zod `safeParse` via `apiFetch({ responseSchema })`.
+
+## Errors and logging
+
+- Pino on the server. `log.<level>({ ...ctx }, "feature.verb")`. No `console.*` in app code.
+- Client: `reportClientError()` + `toast.error`. Never swallow.
+- `/api/log/client-error` is same-origin, Zod, size-capped, IP-capped. Reconstruct `Error` so Pino's `err` serializer works.
+- IP on client-error / `request.error` only.
+- `APP_ENV` drives source maps. Dual `level` + `severity`. No Sentry/PostHog without a DSN.
+
+## UI, tests, git
+
+- kebab-case files. Tokens + Tailwind. shadcn only.
+- Forms: `react-hook-form` + `zodResolver`.
+- `next/image`, `next/font`, assets in `public/`.
+- Commit: `type: description`.
 ```
 
 ---
 
 ### 19. CLAUDE.md
 
-Create `CLAUDE.md` at repo root:
+Write `CLAUDE.md` in full. No nested fences inside the template.
 
 ```markdown
 # CLAUDE.md
 
-Auto-loaded by Claude Code. Companion files:
-- [`STANDARDS.md`](./STANDARDS.md) — engineering rules
-- [`REVIEW.md`](./REVIEW.md) — review rubric
-- [`AGENTS.md`](./AGENTS.md) — AI review bot entry point
+Companion files: [`AGENTS.md`](./AGENTS.md), [`STANDARDS.md`](./STANDARDS.md), [`REVIEW.md`](./REVIEW.md).
 
----
+Never commit, push, or open a PR unless the user asks. Never `--no-verify`.
 
-## Never run git commands — show them instead
+## Repo
 
-Never execute `git add`, `git commit`, `git push`, or any mutating git command. Paste the exact commands for the user to run instead.
-
----
-
-## Repo orientation
-
-Frontend-only Next.js 16 app. Bun = package manager, Node.js = runtime.
+Frontend-only Next.js 16. Bun = package manager, Node.js = runtime. No Postgres, no NextAuth, no Redis.
 
 | Surface | Where |
 |---|---|
-| Marketing / public pages | `src/app/(marketing)/` |
-| Authenticated UI (if applicable) | `src/app/(app)/` |
-| Minimal API routes (health, client error reporting) | `src/app/api/` |
-| Business logic / data fetching | `src/features/<name>/` |
-| Shared utilities | `src/lib/` |
+| Marketing | `src/app/(marketing)/` |
+| App UI | `src/app/(app)/` if client-side auth against an external API |
+| Health | `src/app/api/health/` — `{ ok: true }`, no DB |
+| Client errors | `src/app/api/log/client-error/` |
+| Features | `src/features/<name>/` |
+| External API client | `src/lib/api/client.ts` |
 
----
+Feature shape: schema, api, hooks, components, index. Cross-feature via `index.ts`.
 
-## Feature folder reference
+## Playbooks
 
-Every feature follows:
-```
-src/features/<name>/
-  components/
-  hooks/          ← React Query hooks
-  schema.ts       ← Zod schemas
-  api.ts          ← Typed fetch wrappers (if hitting an external API)
-  index.ts
-```
+### Add a feature
+Create the folder in the canonical shape. External reads go through `api.ts` + React Query hooks.
 
-Cross-feature imports go through `index.ts`. Never deep-import.
+### Add a server action or `/api/v1`
+Don't. Use the server-actions or REST scaffold.
 
----
+### Add an env var
+`.env.example`. `NEXT_PUBLIC_*` is public. `APP_ENV` is a build ARG.
 
 ## Gotchas
 
-**`page.tsx` files never use `"use client"`.** Adding it kills server rendering — the crawler sees an empty shell. Extract interactivity into a child component (e.g. `_components/add-to-cart-button.tsx`) and import it. Same rule for `layout.tsx`.
-
-**Server state through React Query, not `useState`.** `useState` + `useEffect` fetching has race conditions, no caching, and re-fetches on every mount. Always React Query.
-
-**Validate external API responses with Zod.** External APIs change shape without notice. The `apiFetch({ responseSchema })` pattern catches drift at the boundary instead of letting it cause cryptic UI errors three components deep.
-
----
-
-## Commands
-
-| Command | What |
-|---|---|
-| `bun install` | Install deps |
-| `bun run dev` | Start dev server on :3000 |
-| `bun run build` | Production build |
-| `bunx vitest run` | Run tests |
-| `bunx tsc --noEmit` | Typecheck |
-| `bunx next lint` | ESLint |
-| `bun audit --audit-level=high` | Security audit |
+- `page.tsx` is never `"use client"`.
+- Validate every external response with Zod — they change without notice.
+- React Query is the cache. Do not add Redis.
 ```
 
 ---
 
 ### 20. AGENTS.md
 
-Create `AGENTS.md`:
+Write `AGENTS.md` in full.
 
 ```markdown
 # AGENTS.md
 
-Entry point for AI code-review agents (Codex, Gemini Code Assist, Claude Code, Devin).
+YAGNI. Never commit unless asked.
 
-Read these in order before reviewing:
-1. [`CLAUDE.md`](./CLAUDE.md) — repo orientation
-2. [`STANDARDS.md`](./STANDARDS.md) — engineering rules
-3. [`REVIEW.md`](./REVIEW.md) — full review rubric
-
----
-
-## Review guidelines
-
-### 🔴 Block-merge (always raise)
-
-- **`"use client"` on a `page.tsx` or `layout.tsx`** — kills SSR/SEO
-- **External API response not validated with Zod** — drift becomes a runtime bug
-- **Form not using `react-hook-form` + `zodResolver`** — `useState` form state is banned
-- **Data fetching with `useState` + `useEffect`** instead of React Query
-- **Hardcoded secrets in code or committed env files** — even `NEXT_PUBLIC_*` for sensitive values is wrong
-- **Module-load throws for runtime env vars** — breaks `next build`'s page-data collection
-- **`<img>` instead of `next/image` for raster images** — kills LCP scores
-
-### 🟡 Discuss / suggest
-
-- Hardcoded color values (`text-red-500`, `bg-[#1a1a1a]`) — use semantic tokens
-- Hardcoded `px` values (`p-[14px]`, `w-[320px]`) — use Tailwind scale
-- Component filename in PascalCase — should be kebab-case
-- `console.log`/`console.error` in client code — use `reportClientError` + `toast.error`
-- New Zustand store added without checking if state actually needs to persist
-- React Query `staleTime` not set on a query (defaults to 0 — refetches aggressively)
-- Missing `defaultValues` on `useForm` — triggers "uncontrolled to controlled" warnings
-
-### ⚪ Skip / don't comment
-
-- Style nits auto-fixed by Prettier
-- Missing tests for trivial helpers
-- Outdated transitive dependencies (handled separately)
-
----
-
-## Files to skip entirely
-
-| Path | Reason |
+| Before you… | Read |
 |---|---|
-| `bun.lock`, `package-lock.json` | Lockfiles |
-| `**/*.test.ts`, `**/*.test.tsx` | Tests reviewed by humans |
-| `STANDARDS.md`, `CLAUDE.md`, `REVIEW.md`, `AGENTS.md` | Context, not code |
-| `**/.next/**`, `**/dist/**`, `**/build/**` | Build artifacts |
-| `**/public/images/**` | Static assets |
+| Feature / fetch / form | [`STANDARDS.md`](./STANDARDS.md) |
+| Review | [`REVIEW.md`](./REVIEW.md) |
+| Orient | [`CLAUDE.md`](./CLAUDE.md) |
 
----
+## Non-negotiables
 
-## Confidence calibration
+1. No `"use server"` mutations, no Drizzle, no NextAuth, no Redis.
+2. Zod at every external boundary. `safeParse` only.
+3. Pino server-side. `reportClientError` client-side. No `console.*`.
+4. React Query for server state. Zustand for client UI state.
+5. `page.tsx` is never `"use client"`.
+6. `APP_ENV` drives source maps. No Sentry/PostHog without a DSN.
 
-- Read the file, not just the diff
-- Don't suggest renames or refactors that aren't behavior changes
-- Don't recommend a component that doesn't exist
-- Match existing patterns
-- If unsure, don't flag unless it's in 🔴 or 🟡
+## Block-merge
+
+- `"use client"` on `page.tsx` / `layout.tsx`
+- External API response not Zod-validated
+- Form without `react-hook-form` + `zodResolver`
+- `useState`+`useEffect` fetching
+- `console.*` in app code
+- Adding NextAuth / Drizzle / Redis "because production"
+
+## Discuss
+
+- Missing `invalidateQueries` on mutation
+- Hardcoded color/px; PascalCase filenames
+
+## Skip
+
+- "Add Sentry / PostHog"
 ```
 
 ---
 
 ### 21. REVIEW.md
 
-Create `REVIEW.md`:
+Write `REVIEW.md` in full.
 
 ```markdown
 # REVIEW.md
 
-Code-review rubric. Applies to humans and bots.
+Read [`CLAUDE.md`](./CLAUDE.md) and [`STANDARDS.md`](./STANDARDS.md).
 
-Read [`CLAUDE.md`](./CLAUDE.md) and [`STANDARDS.md`](./STANDARDS.md) first.
+## Block-merge
 
----
+- `"use client"` on route entries
+- Unvalidated external JSON
+- `console.*`
+- `"use server"` / first-party DB sneaking in
 
-## Severity rubric
+## Discuss
 
-### 🔴 Block-merge
+- Missing React Query invalidation
+- Zustand god-store
+- Hardcoded tokens
 
-- **`"use client"` on a `page.tsx` / `layout.tsx`** — kills SSR/SEO
-- **External API response without Zod validation** — drift causes runtime bugs
-- **Form without `react-hook-form` + `zodResolver`** — `useState` form state is banned
-- **Server state fetched with `useState` + `useEffect`** instead of React Query
-- **Module-load throws for env vars** — breaks `next build`
-- **Hardcoded secrets** in code or env files committed to git
-- **`<img>` instead of `next/image`** for raster images
+## Skip
 
-### 🟡 Discuss
-
-- Hardcoded color / px values — use semantic tokens / Tailwind scale
-- Component filename in PascalCase — should be kebab-case
-- `console.*` in client code — use `reportClientError` + `toast.error`
-- React Query `staleTime` not set — defaults to 0 and refetches aggressively
-- Form `useForm` without `defaultValues` — triggers controlled-input warnings
-- Cross-feature deep imports — go through `index.ts`
-- Native `confirm()` / `alert()` — use shadcn `Dialog`
-- Duplicate shadcn components — extend via `cva` variants
-
-### ⚪ Skip
-
-- Auto-fixable style nits
-- Theoretical edge cases without a concrete path
-- Missing tests for trivial helpers
-- Outdated transitive dependencies (handled separately)
-
-### Files to skip entirely
-
-| Path | Reason |
-|---|---|
-| `bun.lock`, `package-lock.json` | Lockfiles |
-| `**/*.test.ts(x)` | Reviewed by humans |
-| `STANDARDS.md`, `CLAUDE.md`, `REVIEW.md`, `AGENTS.md` | Context |
-| `**/.next/**`, `**/dist/**`, `**/build/**` | Build artifacts |
-| `**/public/**` | Static assets |
-
----
-
-## Confidence calibration
-
-- Read the file, not just the diff
-- Don't suggest refactors that aren't behavior changes
-- Don't recommend components that don't exist — check `src/components/ui/`
-- Match existing patterns
-- If unsure, don't flag unless 🔴 or 🟡
+- Prettier nits; "add Sentry/PostHog/Redis"
 ```
 
 ---
@@ -1206,25 +1283,22 @@ Create `.github/pull_request_template.md`:
 
 ### 23. `next.config.ts`
 
-Create `next.config.ts`:
-
+`APP_ENV` is a **build ARG**. Prod keeps source maps **off**.
 ```typescript
 import type { NextConfig } from "next";
+import { ENVIRONMENT_SETTINGS, appEnvironment } from "./src/lib/app-environment";
+
+const environment = ENVIRONMENT_SETTINGS[appEnvironment(process.env.APP_ENV)];
 
 const nextConfig: NextConfig = {
-  // Required for Docker / Cloud Run deploys — builds a self-contained
-  // output directory instead of relying on node_modules at runtime.
   output: "standalone",
-
+  productionBrowserSourceMaps: environment.enableBrowserSourceMaps,
+  serverExternalPackages: ["pino"],
   images: {
     remotePatterns: [
-      // Add every external image domain here. Never use dangerouslyAllowSVG
-      // or wildcard hostnames.
       // { protocol: "https", hostname: "images.example.com" },
     ],
   },
-
-  // Security headers — applied to every response
   async headers() {
     return [
       {
@@ -1247,35 +1321,13 @@ export default nextConfig;
 
 ### 24. `instrumentation.ts`
 
-Create `src/instrumentation.ts`:
-
 ```typescript
 export async function register(): Promise<void> {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
-
+  const { attachProcessHandlers } = await import("./lib/process-handlers");
+  attachProcessHandlers();
   const { log } = await import("./lib/log");
-
-  process.on("uncaughtException", (err) => {
-    log.fatal({ err }, "process.uncaught_exception");
-    process.exit(1);
-  });
-
-  process.on("unhandledRejection", (reason) => {
-    log.fatal({ reason }, "process.unhandled_rejection");
-  });
-
-  process.on("SIGTERM", () => {
-    log.info("process.sigterm — shutting down");
-    process.exit(0);
-  });
-
-  const REQUIRED = ["NEXT_PUBLIC_APP_URL"];
-
-  for (const key of REQUIRED) {
-    if (!process.env[key]) {
-      log.error({ key }, `instrumentation.missing_env — ${key} is not set`);
-    }
-  }
+  if (!process.env.NEXT_PUBLIC_APP_URL) log.warn({ key: "NEXT_PUBLIC_APP_URL" }, "instrumentation.missing_env");
 }
 
 export async function onRequestError(
@@ -1290,12 +1342,13 @@ export async function onRequestError(
   const { log } = await import("./lib/log");
   const error = err instanceof Error ? err : new Error(String(err));
   const digest = (error as Error & { digest?: string }).digest;
-
+  const xff = request.headers["x-forwarded-for"];
+  const ip = xff?.split(",")[0]?.trim() ?? request.headers["x-real-ip"] ?? null;
   log.error(
     {
       err: error,
       digest,
-      request: { path: request.path, method: request.method },
+      request: { path: request.path, method: request.method, ip },
       route: { kind: context.routerKind, path: context.routePath, type: context.routeType },
     },
     "request.error"
@@ -1780,18 +1833,24 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
+ARG APP_ENV=dev
 ARG NEXT_PUBLIC_APP_URL
 ARG NEXT_PUBLIC_API_URL
+ENV APP_ENV=$APP_ENV
 ENV NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 ENV NEXT_TELEMETRY_DISABLED=1
 
 RUN bun run build
 
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
+ARG APP_ENV=dev
+ENV APP_ENV=$APP_ENV
+ARG NEXT_PUBLIC_APP_URL
+ENV NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
 
 RUN addgroup -S nodejs && adduser -S nextjs -G nodejs
 
@@ -1818,7 +1877,6 @@ node_modules
 .idea
 .DS_Store
 *.log
-*.lock
 *.tsbuildinfo
 .env
 .env.local
@@ -1879,27 +1937,17 @@ git commit -m "chore: initial project setup"
 | Piece | What it does |
 |---|---|
 | Bun + Next.js 16 | Fast installs, Node.js runtime |
-| Husky hooks | Format, lint, types, tests, audit on every push |
-| Conventional commits | Enforced by commit-msg hook |
-| shadcn/ui + tweakcn theme | Full token set, no hardcoded colors |
-| Zod conventions | `safeParse` everywhere, user-facing messages |
-| Forms | `react-hook-form` + `zodResolver` — same schema as API validation |
-| React Query | Server state with cache, no `useState` fetching |
-| Zustand | Client-only state, one store per concern |
-| API client | Typed fetch wrapper, Zod response validation |
-| Feature folder pattern | `components → hooks → schema → api → index` |
-| Vitest + Testing Library | Component, hook, schema tests |
-| Pino logger | Structured JSON for SSR errors |
-| Client error reporting | `/api/log/client-error` + `reportClientError()` |
-| Styling conventions | Kebab-case files, no hardcoded px/colors, mobile-first |
-| `next.config.ts` | `standalone` output, security headers |
-| `instrumentation.ts` | Env validation + `onRequestError` |
-| Error/loading pages | `error.tsx`, `global-error.tsx`, `not-found.tsx`, `loading.tsx` |
-| SEO | `sitemap.ts`, `robots.ts`, OG image conventions, per-page metadata |
-| Static generation | `generateStaticParams` for dynamic routes (fastest TTFB) |
-| Governance docs | `CLAUDE.md`, `STANDARDS.md`, `AGENTS.md`, `REVIEW.md` |
-| Vercel deploy | GitHub Actions workflow + `vercel.json` disabling auto-deploy |
-| Dockerfile | Multi-stage Bun→Node build for non-Vercel hosts |
-| CI workflow | Parallel lint/format/typecheck/audit/test jobs |
+| shadcn/ui | CSS variables (tweakcn optional later) |
+| React Query | Server state cache (`staleTime` + `invalidateQueries`) — no Redis |
+| Zustand | Client UI state, one store per concern |
+| `apiFetch` | Typed fetch + Zod `responseSchema` for **external** APIs |
+| Pino logger | JSON + GCP severity, `APP_LOG_FILE`, redaction, `no-console` |
+| Client errors | Same-origin, Zod, IP-capped `/api/log/client-error` |
+| Source maps | `APP_ENV` build ARG — on local/dev, **off prod** |
+| Health | `/api/health` `{ ok: true }` — no DB |
+| Governance docs | `CLAUDE.md` · `AGENTS.md` · `STANDARDS.md` · `REVIEW.md` — written in full |
+| Dockerfile | Bun→Node 22, `APP_ENV` + `NEXT_PUBLIC_*` only at build |
+| Feature folders | `schema → api → hooks → index → components` |
 
 ## PROMPT END
+

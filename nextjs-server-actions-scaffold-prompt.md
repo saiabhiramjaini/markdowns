@@ -1,13 +1,77 @@
-# Next.js Production Scaffold Prompt
+# Next.js Server-Actions Scaffold Prompt
 
-Copy-paste this entire prompt to scaffold a new production-ready Next.js app from scratch.
+Copy-paste this entire prompt to scaffold a production-ready Next.js app with **server actions** (no public REST API).
 Replace `{{APP_NAME}}` with your app name (kebab-case, e.g. `my-app`).
+
+**Use this when:** the app is Next.js-only with no plan for mobile / third-party HTTP consumers. Mutations are server actions (`ActionResult`). Server components read via `queries.ts`. Webhooks + health + client-error are the only extra HTTP routes.
+
+**Use the REST `/api/v1` prompt instead when:** a mobile client, third-party integrator, or non-TS client must call the same API.
+
+**Use the frontend-only prompt instead when:** you have no first-party database or auth.
 
 ---
 
 ## PROMPT START
 
-Scaffold a production-ready Next.js app called `{{APP_NAME}}`. Follow every instruction exactly — don't add extras, don't skip steps.
+Scaffold a production-ready Next.js app called `{{APP_NAME}}` using **server actions** for every mutation. Follow every instruction exactly — don't add extras, don't skip steps.
+
+Non-interactive CLIs only: `bunx shadcn@latest init -d`. Do not open tweakcn / Neon / Google / Upstash / Vercel in a browser — stub `.env.example` and leave a post-scaffold checklist. Ship a default `globals.css` token set (shadcn Slate + CSS variables).
+
+**Write `CLAUDE.md`, `AGENTS.md`, `STANDARDS.md`, and `REVIEW.md` in full from the templates in this prompt.** Do not stub. They must match §0. Do **not** add Sentry, PostHog, or a Redis response cache.
+
+---
+
+### 0. Exception handling, errors, logging, observability (read first)
+
+Four layers. Do not mix them.
+
+```
+return fail() / throw Error   →   withAction catch
+        │                              ├─ fail(...)           → { success: false, error } (user-safe)
+        │                              └─ unknown Error       → log.error + fail("Something went wrong.")
+log.info / warn / error       →   stdout JSON. Operators only.
+logAudit(...)                 →   audit_logs table. Durable "who did what".
+```
+
+**Exceptions**
+
+- Expected failure returns `fail("…")` — validation, auth, not-found, unique conflict. That is not a crash.
+- Unexpected failure is a real `Error`. `withAction` is the **only** `try/catch` around an action. Actions do not catch-and-swallow. Never throw `err.message` across the server/client boundary.
+- Unique-key collisions (`pg` `23505`) → `fail("Already exists.")`.
+- Process: `uncaughtException` → `log.fatal` in Node-only `process-handlers.ts` (not inside `instrumentation.ts`). `unhandledRejection` → `log.error`.
+
+**Error handling (what the client sees)**
+
+```ts
+{ success: true, data }
+{ success: false, error: "Thing not found." }   // canned English, never err.message
+```
+
+Other users' ids → not-found fail, not a leaky "forbidden". Forms show `result.error` via `form.setError` + `toast.error`.
+
+**Logging**
+
+Pino only. `console.*` is an ESLint error. `log.<level>({ ...context }, "feature.verb")`.
+
+| Level | When |
+|---|---|
+| `fatal` | Process is going down |
+| `error` | This action/request actually failed |
+| `warn` | Recoverable (expected fail() already returned, Redis down) |
+| `info` | State change (`things.created`) |
+| `debug` | Off in prod unless `LOG_LEVEL=debug` |
+
+Writes: `log.info` **and** `logAudit`. Reads do neither. IP belongs on `audit_logs` and on `client.error_reported` / `request.error` — not on every `log.info`.
+
+**Observability**
+
+- Dual fields: `level` + GCP `severity`. `service` from `DD_SERVICE`.
+- `APP_ENV=local|dev|prod` is a **build ARG**. Browser source maps on local/dev, **off prod**. Not `NODE_ENV`.
+- `/api/health` → `SELECT 1` → 503 if DB down.
+- Client errors POST same-origin to `/api/log/client-error`.
+- Next `onRequestError` logs as `request.error`.
+- Redis is **rate limiting only**. No Redis/CDN cache of authenticated pages/JSON. Cache for the UI is `revalidatePath` after writes.
+- Do not add Sentry or PostHog until a DSN/key exists.
 
 ---
 
@@ -86,32 +150,24 @@ Add to root `package.json`:
 
 ### 3. shadcn/ui + theme
 
-**Step 1 — Init shadcn:**
+**Step 1 — Init shadcn (non-interactive):**
 ```bash
-bunx shadcn@latest init
+bunx shadcn@latest init -d
 ```
 
-When prompted:
-- Style: **Default**
-- Base color: **Slate**
-- CSS variables: **Yes**
+Defaults (Default style, Neutral/Slate, CSS variables) are fine. Do not wait for a TTY.
 
 **Step 2 — Add the base component set:**
 ```bash
 bunx shadcn@latest add button input label textarea dialog dropdown-menu badge toast card separator skeleton tabs select checkbox radio-group switch tooltip popover sheet command avatar form
 ```
 
-**Step 3 — Get `globals.css` from tweakcn.com:**
+**Step 3 — Theme:** keep the shadcn `globals.css` token set. Optionally replace later from tweakcn.com — not part of codegen.
 
-Go to [tweakcn.com](https://tweakcn.com) → pick a theme → copy the generated CSS → replace the contents of `src/app/globals.css` entirely with what tweakcn gives you.
-
-Do not hand-write CSS variables. tweakcn generates the full `:root` + `.dark` variable set that shadcn components expect (`--background`, `--foreground`, `--primary`, `--muted`, `--border`, `--ring`, etc.).
-
-**Rules for using shadcn:**
-- Always install a component via `bunx shadcn@latest add <name>` — never copy-paste component code manually
-- Never duplicate a shadcn component — if `Button` exists, use it everywhere, don't make a `CustomButton`
-- Compose complex UI by combining shadcn primitives — don't rewrite them
-- If you need a variant that doesn't exist, extend the existing component's `variants` config using `cva`, don't create a parallel component
+**Rules:**
+- Always install via `bunx shadcn@latest add <name>` — never copy-paste manually
+- Never duplicate a shadcn component — extend via `cva` variants
+- Compose complex UI by combining primitives — don't rewrite them
 
 ---
 
@@ -218,23 +274,37 @@ DATABASE_URL_DIRECT=postgresql://user:pass@ep-xxx.region.aws.neon.tech/dbname?ss
 - The `?sslmode=require` at the end is Neon's requirement — other providers may not need it
 - Neon's free tier pauses the database after 5 minutes of inactivity — the first query after a pause takes ~1s to wake it. Upgrade to a paid plan for production.
 
-Create `src/db/index.ts`:
+Create `src/db/index.ts` — **lazy**. `next build` imports this module; a top-level throw on `DATABASE_URL` kills CI.
 ```typescript
 import { Pool } from "pg";
 import { drizzle } from "drizzle-orm/node-postgres";
 import * as schema from "./schema";
+import { databaseUrl } from "@/lib/env";
 
-const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl) throw new Error("DATABASE_URL is not set");
+type Db = ReturnType<typeof drizzle<typeof schema>>;
 
-const pool = new Pool({
-  connectionString: databaseUrl,
-  ssl: databaseUrl.includes("sslmode=disable") ? false : { rejectUnauthorized: false },
-});
+let pool: Pool | undefined;
+let cached: Db | undefined;
 
-export const db = drizzle(pool, { schema });
+function sslFor(url: string) {
+  const local = url.includes("localhost") || url.includes("127.0.0.1");
+  if (local || url.includes("sslmode=disable")) return false;
+  return { rejectUnauthorized: true } as const;
+}
+
+/** Call from actions / queries — never at module import. */
+export function getDb(): Db {
+  if (cached) return cached;
+  const url = databaseUrl();
+  pool = new Pool({ connectionString: url, ssl: sslFor(url) });
+  cached = drizzle(pool, { schema });
+  return cached;
+}
+
 export * from "./schema";
 ```
+
+Use `getDb().query` / `getDb().insert` everywhere the old code said `db.` (queries, actions, audit, health).
 
 Create `src/db/schema/index.ts` — re-export all tables from here.
 
@@ -336,7 +406,7 @@ export const authConfig: NextAuthConfig = {
       },
     }),
   ],
-  session: { strategy: "jwt" },
+  session: { strategy: "jwt" }, // JWT only. Adapter persists users/accounts, not DB sessions.
   // Required for deployments behind a reverse proxy (Cloud Run, Railway, Fly,
   // Vercel) — the host header is set by the load balancer, not the container.
   trustHost: true,
@@ -359,16 +429,22 @@ export const authConfig: NextAuthConfig = {
 };
 ```
 
-**`src/features/auth/index.ts`** — full NextAuth with Drizzle adapter:
+**`src/features/auth/index.ts`** — adapter via lazy `getDb()` so import does not throw at build:
 ```typescript
 import NextAuth from "next-auth";
 import { DrizzleAdapter } from "@auth/drizzle-adapter";
-import { db } from "@/db";
+import { getDb } from "@/db";
 import { authConfig } from "./lib/config";
+
+const dbProxy = new Proxy({} as ReturnType<typeof getDb>, {
+  get(_target, prop) {
+    return Reflect.get(getDb() as object, prop);
+  },
+});
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   ...authConfig,
-  adapter: DrizzleAdapter(db),
+  adapter: DrizzleAdapter(dbProxy as never),
 });
 ```
 
@@ -495,10 +571,14 @@ const apiLimiter = createRateLimiter({ windowMs: 60_000, max: 60 });
 
 export default auth(async (req) => {
   const { pathname } = req.nextUrl;
+  const isAuthRoute = pathname.startsWith("/api/auth");
+  const isWebhook = pathname.startsWith("/api/webhooks");
+  const isHealth = pathname.startsWith("/api/health");
+  const isClientError = pathname.startsWith("/api/log/client-error");
+  const isPublicPage = ["/login", "/terms", "/privacy"].includes(pathname);
 
-  // Rate limit public API routes by IP — skip auth routes (NextAuth handles
-  // those) and skip webhook endpoints (signature verification is their gate).
-  const isPublicApi = pathname.startsWith("/api/") && !pathname.startsWith("/api/auth");
+  const isPublicApi =
+    pathname.startsWith("/api/") && !isAuthRoute && !isWebhook && !isHealth;
   if (isPublicApi) {
     const result = await apiLimiter(getIp(req));
     if (!result.allowed) {
@@ -509,12 +589,8 @@ export default auth(async (req) => {
     }
   }
 
-  // Auth guard — redirect unauthenticated users to login
+  if (isAuthRoute || isWebhook || isHealth || isClientError || isPublicPage) return;
   const isLoggedIn = !!req.auth;
-  const isAuthRoute = pathname.startsWith("/api/auth");
-  const isPublicPage = ["/login", "/terms", "/privacy"].includes(pathname);
-
-  if (isAuthRoute || isPublicPage) return;
   if (!isLoggedIn) {
     const loginUrl = new URL("/login", req.nextUrl.origin);
     loginUrl.searchParams.set("callbackUrl", pathname);
@@ -547,6 +623,67 @@ export const ok = <T>(data: T): { success: true; data: T } => ({
 
 export const firstError = (issues: { message: string }[], fallback: string): string =>
   issues[0]?.message ?? fallback;
+
+export function isPgUniqueViolation(err: unknown): boolean {
+  return typeof err === "object" && err !== null && "code" in err && err.code === "23505";
+}
+```
+
+**`src/lib/with-action.ts`** — the only `try/catch` around a server action.
+```typescript
+import { log } from "@/lib/log";
+import { fail, type ActionResult } from "@/lib/action-result";
+
+export async function withAction<T>(
+  name: string,
+  fn: () => Promise<ActionResult<T>>
+): Promise<ActionResult<T>> {
+  try {
+    return await fn();
+  } catch (err) {
+    log.error({ err }, `${name}.unhandled_error`);
+    return fail("Something went wrong.");
+  }
+}
+```
+
+**`src/lib/env.ts`** — lazy getters. Call from a request/action, never at module import.
+```typescript
+function required(name: string): () => string {
+  let cached: string | undefined;
+  return () => {
+    if (cached !== undefined) return cached;
+    const value = process.env[name];
+    if (!value) throw new Error(`${name} is not set`);
+    cached = value;
+    return value;
+  };
+}
+
+export const databaseUrl = required("DATABASE_URL");
+export const authSecret = required("AUTH_SECRET");
+
+export function webhookSecret(): string | undefined {
+  return process.env.WEBHOOK_SECRET;
+}
+```
+
+**`src/lib/app-environment.ts`** — `NODE_ENV` cannot tell Cloud Run `dev` from `prod`.
+```typescript
+export const APP_ENVIRONMENTS = ["local", "dev", "prod"] as const;
+export type AppEnvironment = (typeof APP_ENVIRONMENTS)[number];
+
+export type EnvironmentSettings = { enableBrowserSourceMaps: boolean };
+
+export const ENVIRONMENT_SETTINGS: Record<AppEnvironment, EnvironmentSettings> = {
+  local: { enableBrowserSourceMaps: true },
+  dev: { enableBrowserSourceMaps: true },
+  prod: { enableBrowserSourceMaps: false },
+};
+
+export function appEnvironment(value: string | undefined): AppEnvironment {
+  return APP_ENVIRONMENTS.includes(value as AppEnvironment) ? (value as AppEnvironment) : "local";
+}
 ```
 
 **`src/lib/log.ts`:**
@@ -569,18 +706,22 @@ const baseOptions: LoggerOptions = {
       return { level: label, severity: PINO_TO_SEVERITY[label] ?? label.toUpperCase() };
     },
     bindings() {
-      return { service: "{{APP_NAME}}" };
+      return { service: process.env.DD_SERVICE ?? "{{APP_NAME}}" };
     },
   },
   timestamp: pino.stdTimeFunctions.isoTime,
   redact: {
     paths: [
-      "password", "*.password", "token", "*.token", "accessToken", "*.accessToken",
-      "refreshToken", "*.refreshToken", "apiKey", "*.apiKey", "secret", "*.secret",
+      "password", "*.password", "*.*.password",
+      "token", "*.token", "*.*.token",
+      "accessToken", "*.accessToken", "refreshToken", "*.refreshToken",
+      "apiKey", "*.apiKey", "api_key", "*.api_key",
+      "secret", "*.secret", "webhookSecret", "*.webhookSecret",
       "authorization", "*.authorization", "headers.authorization", "headers.cookie",
       "privateKey", "*.privateKey", "credentials", "*.credentials",
     ],
     censor: "[REDACTED]",
+    remove: false,
   },
 };
 
@@ -589,7 +730,31 @@ const devTransport: LoggerOptions["transport"] =
     ? { target: "pino-pretty", options: { colorize: true, translateTime: "SYS:HH:MM:ss.l", ignore: "pid,hostname,service,severity" } }
     : undefined;
 
-export const log: Logger = pino({ ...baseOptions, ...(devTransport ? { transport: devTransport } : {}) });
+function buildDestination(): pino.DestinationStream | undefined {
+  const appLogFile = process.env.APP_LOG_FILE;
+  if (!appLogFile || devTransport) return undefined;
+  try {
+    const fileStream = pino.destination({ dest: appLogFile, mkdir: true, sync: false });
+    fileStream.on("error", () => {});
+    return pino.multistream([
+      { stream: pino.destination({ dest: 1, sync: false }) },
+      { stream: fileStream },
+    ]);
+  } catch (err) {
+    process.stderr.write(
+      `[log] APP_LOG_FILE unusable, stdout only: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+    return undefined;
+  }
+}
+
+const destination = buildDestination();
+
+export const log: Logger = devTransport
+  ? pino({ ...baseOptions, transport: devTransport })
+  : destination
+    ? pino(baseOptions, destination)
+    : pino(baseOptions);
 
 export function getClientIp(headers: Headers): string | null {
   const xff = headers.get("x-forwarded-for");
@@ -613,10 +778,30 @@ export function getIp(req: NextRequest): string {
 }
 ```
 
+**`src/lib/process-handlers.ts`** — Node-only. Do not put `process.on` in `instrumentation.ts`.
+```typescript
+import { log } from "./log";
+
+export function attachProcessHandlers(): void {
+  if ((globalThis as { __processHandlers?: boolean }).__processHandlers) return;
+  (globalThis as { __processHandlers?: boolean }).__processHandlers = true;
+
+  process.on("uncaughtException", (err) => {
+    log.fatal({ err }, "process.uncaught_exception");
+  });
+  process.on("unhandledRejection", (reason) => {
+    log.error(
+      { err: reason instanceof Error ? reason : new Error(String(reason)) },
+      "process.unhandled_rejection"
+    );
+  });
+}
+```
+
 **`src/lib/audit.ts`:**
 ```typescript
 import { headers } from "next/headers";
-import { db } from "@/db";
+import { getDb } from "@/db";
 import { auditLogs } from "@/db/schema";
 import { getClientIp } from "@/lib/log";
 
@@ -650,7 +835,7 @@ async function readRequestMeta(): Promise<{ ip: string | null; userAgent: string
 
 export async function logAudit(params: LogAuditParams): Promise<void> {
   const meta = await readRequestMeta();
-  await db.insert(auditLogs).values({
+  await getDb().insert(auditLogs).values({
     userId: params.userId,
     action: params.action,
     resource: params.resource,
@@ -814,32 +999,74 @@ try {
 
 Create `src/lib/report-client-error.ts`:
 ```typescript
-export function reportClientError(err: unknown, context?: Record<string, unknown>): void {
+export function reportClientError(err: unknown, source = "unknown"): void {
+  if (typeof window === "undefined") return;
   const message = err instanceof Error ? err.message : String(err);
   const stack = err instanceof Error ? err.stack : undefined;
   fetch("/api/log/client-error", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ message, stack, context }),
-  }).catch(() => {}); // best-effort
+    body: JSON.stringify({
+      message: message.slice(0, 2_000),
+      stack: stack?.slice(0, 8_000),
+      source: typeof source === "string" ? source.slice(0, 50) : "unknown",
+      url: window.location.href.slice(0, 2_000),
+    }),
+    keepalive: true,
+    credentials: "same-origin",
+  }).catch(() => {});
 }
 ```
 
-Create `src/app/api/log/client-error/route.ts`:
+Create `src/app/api/log/client-error/route.ts` — same-origin, Zod, size cap, IP rate limit:
 ```typescript
 import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
 import { log } from "@/lib/log";
+import { getIp } from "@/lib/get-ip";
 
 export const runtime = "nodejs";
 
-export async function POST(req: NextRequest): Promise<NextResponse> {
-  try {
-    const body = await req.json();
-    log.error({ ...body, source: "client" }, "client.error");
-  } catch {
-    // malformed body — ignore
+const Schema = z.object({
+  message: z.string().min(1).max(2_000),
+  stack: z.string().max(8_000).optional(),
+  source: z.string().min(1).max(50),
+  url: z.string().max(2_000).optional(),
+});
+
+const buckets = new Map<string, { count: number; resetAt: number }>();
+
+function allow(ip: string): boolean {
+  const now = Date.now();
+  const b = buckets.get(ip);
+  if (!b || b.resetAt <= now) {
+    buckets.set(ip, { count: 1, resetAt: now + 60_000 });
+    return true;
   }
-  return NextResponse.json({ ok: true });
+  if (b.count >= 10) return false;
+  b.count += 1;
+  return true;
+}
+
+export async function POST(req: NextRequest): Promise<NextResponse> {
+  const origin = req.headers.get("origin");
+  const app = process.env.NEXT_PUBLIC_APP_URL;
+  if (origin && app && origin !== new URL(app).origin) {
+    return new NextResponse(null, { status: 204 });
+  }
+  if (Number(req.headers.get("content-length") ?? 0) > 12_000) {
+    return new NextResponse(null, { status: 413 });
+  }
+  const ip = getIp(req);
+  if (!allow(ip)) return new NextResponse(null, { status: 429 });
+
+  const parsed = Schema.safeParse(await req.json().catch(() => null));
+  if (!parsed.success) return new NextResponse(null, { status: 400 });
+
+  const err = new Error(parsed.data.message);
+  if (parsed.data.stack) err.stack = parsed.data.stack;
+  log.error({ err, source: parsed.data.source, client: { url: parsed.data.url, ip } }, "client.error_reported");
+  return new NextResponse(null, { status: 204 });
 }
 ```
 
@@ -853,14 +1080,17 @@ Create `src/features/_template/` with these files. This is the canonical shape e
 
 **`queries.ts`** — Read-only Drizzle queries. Export typed row types.
 
-**`actions.ts`** — Server actions (`"use server"` at the top of the file, never inline). Every action follows this exact order:
-1. `auth()` → check `session?.user?.id`
-2. `Schema.safeParse(input)` → return `fail(firstError(...))`
-3. DB write
+**`actions.ts`** — Server actions (`"use server"` at the top of the file, never inline). Wrap every exported action in `withAction`. Inside:
+
+1. `auth()` → check `session?.user?.id` → `fail("Unauthorized")`
+2. `Schema.safeParse(input)` → `fail(firstError(...))`
+3. DB write via `getDb()`. Map `23505` with `isPgUniqueViolation` → `fail("Already exists.")`
 4. `log.info({ userId, ...context }, "feature.verb")`
 5. `await logAudit({ userId, action: "feature.verb", resource: id })`
 6. `revalidatePath(...)` on affected paths
 7. `return ok(result)`
+
+No second `try/catch`. Never return `err.message`.
 
 **`index.ts`** — Narrow public barrel: page components + actions + types only. Cross-feature imports go through this file, never deep-imports.
 
@@ -1202,10 +1432,15 @@ src/
       components/
   lib/
     action-result.ts
+    with-action.ts
+    env.ts
+    app-environment.ts
     log.ts
+    process-handlers.ts
     audit.ts
     get-ip.ts
     rate-limit.ts
+    webhook.ts
     report-client-error.ts
   db/
     index.ts
@@ -1238,14 +1473,14 @@ export default async function PlatformLayout({ children }: { children: React.Rea
 **`src/app/api/health/route.ts`:**
 ```typescript
 import { NextResponse } from "next/server";
-import { db } from "@/db";
+import { getDb } from "@/db";
 import { sql } from "drizzle-orm";
 
 export const runtime = "nodejs";
 
 export async function GET() {
   try {
-    await db.execute(sql`SELECT 1`);
+    await getDb().execute(sql`SELECT 1`);
     return NextResponse.json({ ok: true });
   } catch {
     return NextResponse.json({ ok: false }, { status: 503 });
@@ -1369,9 +1604,15 @@ AUTH_GOOGLE_SECRET=your-google-oauth-client-secret
 
 # App
 NEXT_PUBLIC_APP_URL=http://localhost:3000
+APP_ENV=local
 LOG_LEVEL=debug
+DD_SERVICE={{APP_NAME}}
+# APP_LOG_FILE=/shared-volume/logs/app.log
 
-# Upstash Redis (rate limiting)
+# Webhook HMAC (raw-body verify). Optional until you add a vendor.
+# WEBHOOK_SECRET=
+
+# Upstash Redis (rate limiting only — not a response cache)
 UPSTASH_REDIS_REST_URL=https://your-db.upstash.io
 UPSTASH_REDIS_REST_TOKEN=your-token
 
@@ -1570,372 +1811,262 @@ export function AddToCartButton({ productId }: { productId: string }) {
 
 ### 17. STANDARDS.md
 
-Create `STANDARDS.md` with these rules (one section per rule):
+Write `STANDARDS.md` in full. Do not stub.
 
-1. **No `any`, no `as` casts on user input** — validate with Zod at every boundary
-2. **Every server action returns `ActionResult<T>`** — no thrown errors crossing the boundary
-3. **`safeParse` in actions, `firstError` for the user message** — never `.parse()`
-4. **Auth gate is the first line of every action** — before any DB call
-5. **No `console.log` server-side** — use `log` from `@/lib/log`
-6. **`log.info` + `logAudit` after every write** — state changes have an audit trail
-7. **`revalidatePath` after every mutation** — on the narrowest affected set of paths
-8. **No top-level `throw` for runtime env vars** — lazy getter pattern only
-9. **`"use server"` only at the top of files, never inline** — extract inline server actions into a `actions.ts` file
-10. **Commit messages: `type: description`** — enforced by commit-msg hook
-11. **Test every action: happy path + auth-fail + validation-fail** — minimum 3 cases
-12. **Feature folders: `schema → queries → actions → index → components`** — no exceptions
-13. **Cross-feature imports go through `index.ts`** — never deep-import into another feature
-14. **Component filenames are kebab-case** — `home-navbar.tsx`, not `HomeNavbar.tsx`
-15. **No hardcoded color values** — use semantic tokens only (`bg-background`, `text-muted-foreground`, `border-border`)
-16. **No hardcoded `px` values** — use Tailwind spacing scale; arbitrary values only when the scale has no match
-17. **Use shadcn components, never duplicate them** — extend via `cva` variants, don't create parallel components
-18. **Rate limit every unauthenticated public route by IP** — never user ID alone; webhooks are exempt (signature verification is their gate)
-19. **`page.tsx` files never use `"use client"`** — pages stay server components so SSR'd content reaches the crawler. If a page needs interactivity, extract the interactive parts into a child component file marked `"use client"`, and have the page render it
-20. **Static assets live in `public/`, referenced with absolute paths** — `/logo.png` not `./logo.png`. No secrets, no private docs, no files >1MB in `public/`
-21. **Use `next/image` for raster images and `next/font` for fonts** — never `<img>` or self-hosted font files unless there's a documented reason
-22. **Every form uses `react-hook-form` + `zodResolver`** — the same Zod schema the server action validates with is the form's resolver. No hand-rolled `useState` form state, no parallel validation logic
+```markdown
+# STANDARDS.md
+
+Engineering rules for this repo. Every code change should satisfy them.
+
+## Architecture (keep it modular)
+
+- Feature folders: `schema → queries → actions → index → components`
+- Cross-feature imports go through `index.ts`. Never deep-import.
+- Queries read. Actions write (auth → safeParse → `getDb()` write → log → audit → revalidate → `ok`).
+- `"use server"` only at the **top** of `actions.ts` files, never inline in JSX.
+- `page.tsx` / `layout.tsx` never use `"use client"`.
+- Server components import `queries.ts` directly.
+- Do not add `/api/v1` mutations. If you need a public HTTP API, use the REST scaffold.
+
+## Errors, logging, observability (four layers — do not mix)
+
+1. Expected failure = `fail("…")`. Crash = thrown `Error`. `withAction` is the only catch.
+2. Client sees `ActionResult` only. Never `err.message` or a stack.
+3. Pino: `log.<level>({ ...context }, "feature.verb")`. No `console.*`.
+4. Writes also call `logAudit`. Reads do neither. IP on `audit_logs` + client-error / `request.error` only.
+
+- Dual `level` + `severity`. `APP_ENV` drives source maps, not `NODE_ENV`.
+- `/api/health` does `SELECT 1`. Redis is rate limit only — fail open. No Redis/CDN cache of authenticated HTML/JSON. No Sentry/PostHog without a DSN.
+
+## Auth, secrets, webhooks, rate limit
+
+- Auth is the first line of every action.
+- Webhooks: HMAC on **raw body**, then parse. Idempotent. Not rate-limited.
+- Rate limit unauthenticated public HTTP by IP. Fail open if Redis is missing.
+- No top-level `throw` on runtime env — `getDb()`, `databaseUrl()`.
+- No secret in code, committed env, or `NEXT_PUBLIC_*`.
+
+## UI, tests, git
+
+- kebab-case files. Tokens + Tailwind scale. shadcn only.
+- Forms: `react-hook-form` + `zodResolver` + the same schema the action `safeParse`s.
+- Test every action: happy path + auth-fail + validation-fail. Assert log event names on writes.
+- `revalidatePath` after every mutation.
+- Commit: `type: description`. Comments explain why, not ticket numbers.
+```
 
 ---
 
 ### 18. CLAUDE.md
 
-Create `CLAUDE.md` at repo root — auto-loaded by Claude Code, also read by other AI tools:
+Write `CLAUDE.md` in full. Do not stub. Nested code fences are forbidden inside this template — use indented trees.
 
 ```markdown
 # CLAUDE.md
 
-Auto-loaded by Claude Code at the start of every session. Companion files:
+Companion files:
+- [`AGENTS.md`](./AGENTS.md) — router + non-negotiables
+- [`STANDARDS.md`](./STANDARDS.md) — engineering rules
+- [`REVIEW.md`](./REVIEW.md) — review rubric
 
-- [`STANDARDS.md`](./STANDARDS.md) — the engineering rules; every code change should satisfy them
-- [`REVIEW.md`](./REVIEW.md) — review rubric (🔴 / 🟡 / ⚪ severity)
-- [`AGENTS.md`](./AGENTS.md) — entry point for AI review bots (Codex, Devin, Gemini)
-
----
-
-## Never run git commands — show them instead
-
-Never execute `git add`, `git commit`, `git push`, `git merge`, `git rebase`, or any other mutating git command. Read-only inspection (`git status`, `git diff`, `git log`) is fine.
-
-Paste the exact commands the user should run themselves. Same rule for `gh pr create`, `gh pr merge`, and anything that mutates branches or PRs.
-
-**Why:** the user reviews staged changes before they hit history. Auto-committing moves work into the remote without the user inspecting the diff.
-
----
+Never commit, push, branch, or open a PR unless the user explicitly asks. Never `--no-verify`.
 
 ## Repo orientation
 
-Single Next.js 16 app. Bun = package manager + script runner. Node.js = app runtime.
+Next.js 16. Bun = package manager, Node.js = runtime. Mutations are **server actions**, not `/api/v1`.
 
-| Surface | Where it lives |
+| Surface | Where |
 |---|---|
 | Authenticated UI | `src/app/(platform)/` |
-| Public pages (login, terms, privacy) | `src/app/(auth)/`, `src/app/terms`, etc. |
-| Public API | `src/app/api/v1/` |
-| Webhooks | `src/app/api/webhooks/` |
-| Business logic | `src/features/<name>/` |
-| Shared utilities | `src/lib/` |
-| DB schema | `src/db/schema/` |
+| Public pages | `src/app/(auth)/`, terms, privacy |
+| Auth HTTP | `src/app/api/auth/[...nextauth]/` |
+| Webhooks | `src/app/api/webhooks/<vendor>/` |
+| Health | `src/app/api/health/` |
+| Client error ingest | `src/app/api/log/client-error/` |
+| Feature | `src/features/<name>/` — schema, queries, actions, components |
+| Shared | `src/lib/` — `with-action`, `log`, `audit`, `getDb` via `@/db` |
 
----
+## Canonical feature
 
-## Canonical feature reference
+        src/features/<name>/
+          schema.ts     Zod
+          queries.ts    reads
+          actions.ts    "use server" + withAction
+          index.ts      barrel
+          components/
 
-When in doubt about how a feature should look, read `src/features/_template/`. Every other feature follows the same shape:
+Action pipeline: withAction → auth → safeParse → getDb() write → log.info → logAudit → revalidatePath → ok().
+Cross-feature via `index.ts`. Client/edge must sub-path import, not the barrel (pg in the barrel).
 
-```
-src/features/<name>/
-  schema.ts       ← Zod input validation, exported types
-  queries.ts      ← Drizzle reads, typed row types
-  actions.ts      ← "use server" at top; auth → safeParse → write → log → audit → revalidate → ok()
-  index.ts        ← public barrel: page components + actions + types
-  components/     ← client + server components for this feature only
-```
+## Four layers
 
-**Cross-feature imports go through `index.ts`** — never deep-import past a feature's barrel. The exception is sub-path imports needed to keep server-only modules out of client/edge bundles (see "Gotchas" below).
+        fail() / throw Error → withAction → ActionResult (user) + log (operator)
+        log.info / warn / error → stdout JSON
+        logAudit → audit_logs
 
----
+IP on audit + client-error / request.error only. Redis = rate limit, fail open, not a cache. No Sentry/PostHog without a DSN.
 
-## How to... (playbooks)
+## Playbooks
 
-### Add a new feature
-```bash
-bun run create-feature <kebab-name>
-```
-Then follow the printed steps: add the DB table, extend `AuditAction`, uncomment skeleton imports, build components, add the route.
+### Add a feature
+Run `bun run create-feature <kebab-name>`. Then DB table, AuditAction, uncomment page export, migrate.
 
 ### Add a server action
-1. Add input schema to `feature/schema.ts` with `.max()` + custom messages on every string
-2. Write the action: `auth() → safeParse → write → log.info → logAudit → revalidatePath → ok(...)`
-3. Re-export from `feature/index.ts`
-4. Test: happy path + auth-fail + validation-fail
+1. Schema in `schema.ts`
+2. `export async function x(input: unknown) { return withAction("feature.verb", async () => { ... }); }`
+3. Re-export from `index.ts`
+4. Test happy + auth-fail + validation-fail
 
-### Add a DB column or table
-1. Edit `src/db/schema/<table>.ts`
-2. Run `bunx drizzle-kit generate` — commit both the SQL and `drizzle/meta/`
-3. `bunx drizzle-kit migrate` to apply locally
+### Add a public REST API
+Don't. Use the REST `/api/v1` scaffold. This app's HTTP surface is auth + webhooks + health + client-error.
 
-⚠️ Adding `NOT NULL` to a populated table without a default fails on deploy. Make it nullable, backfill, then tighten.
+### Add a webhook
+`runtime = "nodejs"`. HMAC on raw body (`req.text()`), then parse, then Zod. Idempotent. Do not rate-limit.
 
 ### Add an env var
-1. Read it via a lazy memoized getter — never top-level `throw` on missing env (breaks `next build`)
-2. Add to `.env.example`
-3. Add to the `REQUIRED` list in `src/instrumentation.ts`
-4. Add to CI workflow's `env:` block
+Lazy getter. `.env.example`. `instrumentation.ts` warn-list if required. Not `NEXT_PUBLIC_*` if secret. `APP_ENV` is a build ARG.
 
-### Add a webhook handler
-1. Route at `src/app/api/webhooks/<vendor>/route.ts` with `export const runtime = "nodejs"`
-2. Verify signature against the **raw body** before parsing JSON
-3. Make the handler idempotent (webhooks retry)
-4. Skip rate limiting for webhook routes — signature verification is the gate
+## Gotchas
 
-### Add a public API route
-1. Authenticate via `authenticateApiToken(req)` — never trust headers alone
-2. Rate limit per IP with `createRateLimiter({...})`
-3. Validate body with Zod `safeParse`
-4. Return a typed JSON response with appropriate HTTP status
-
----
-
-## Gotchas (non-obvious)
-
-**`page.tsx` files never use `"use client"`.** Adding `"use client"` to a route entry kills server rendering — the crawler sees an empty shell instead of your content, breaking SEO and link previews. If a page needs interactivity, extract it into a child component (e.g. `_components/add-to-cart-button.tsx`) and import it. Same rule for `layout.tsx` and any other route-entry file.
-
-**Sub-path imports for client/edge code.** A feature's `index.ts` re-exports page components, which are server components that transitively import server-only code (`pg`, etc.). If a **client component** or `middleware.ts` imports from `@/features/X`, the edge bundler walks the whole barrel and errors with `Module not found: Can't resolve 'child_process'`. Fix: import from the sub-path (`@/features/X/lib/something`), not the barrel.
-
-**`"use server"` files cannot re-export types.** Next.js's RPC scanner treats every export as a server action. Re-export types from a non-`"use server"` module.
-
-**No top-level throws for runtime env vars.** `next build`'s "Collecting page data" step imports every route module in Node. If a module top-levels `if (!process.env.X) throw ...`, the build dies in CI where X isn't set. Use a lazy memoized getter.
-
-**`audit_logs.user_id` is FK→`users.id`, nullable.** System-triggered audit entries (webhooks, crons) pass `userId: null`, not some other UUID. The FK rejects anything else.
-
-**Bearer token parsing is case-insensitive.** RFC 7235. Datadog / PagerDuty / Grafana send `bearer ` (lowercase). Use `.toLowerCase().startsWith("bearer ")`.
-
----
+- `page.tsx` is never `"use client"`.
+- `"use server"` files cannot re-export types.
+- `getDb()` is lazy. Top-level `new Pool(process.env.DATABASE_URL)` dies in `next build`.
+- `audit_logs.user_id` is FK → users.id, nullable. System events pass `null`.
+- Do not cache authenticated pages in Redis.
 
 ## Commands
 
 | Command | What |
 |---|---|
-| `bun install` | Install deps (frozen-lockfile in CI) |
-| `bun run dev` | Start dev server on :3000 |
+| `bun install` | Install deps |
+| `bun run dev` | Dev :3000 |
 | `bun run build` | Production build |
-| `bun run create-feature <name>` | Scaffold a new feature from the template |
-| `bunx vitest run` | Run all tests |
+| `bun run create-feature <name>` | Scaffold a feature |
+| `bunx vitest run` | Tests |
 | `bunx tsc --noEmit` | Typecheck |
 | `bunx next lint` | ESLint |
-| `bunx drizzle-kit generate` | Generate migration from schema diff |
+| `bunx drizzle-kit generate` | Generate migration |
 | `bunx drizzle-kit migrate` | Apply migrations |
-| `bunx drizzle-kit studio` | DB GUI on :4983 |
 | `bun audit --audit-level=high` | Security audit |
 ```
+
 
 ---
 
 ### 19. AGENTS.md
 
-Create `AGENTS.md` at repo root — entry point for AI review bots (Codex, Devin, Gemini Code Assist):
+Write `AGENTS.md` in full. It is the **router**.
 
 ```markdown
 # AGENTS.md
 
-Configuration for AI code-review agents (Codex, Gemini Code Assist, Claude Code, Devin) working in this repository.
+## Coding principles
 
-This file is the entry point. The full rubric and codebase context live in three companion files; read them in order before reviewing:
+- YAGNI. Prefer `withAction`, `fail`/`ok`, `log`, `logAudit`, `getDb()`.
+- Comments explain the code's why, not ticket numbers.
 
-1. **[`CLAUDE.md`](./CLAUDE.md)** — repo orientation, gotchas, "how to add X" playbooks, and conventions
-2. **[`STANDARDS.md`](./STANDARDS.md)** — engineering rules that apply to every change
-3. **[`REVIEW.md`](./REVIEW.md)** — full review rubric with severity tiers
+## Work management
 
-What follows is a high-leverage summary so you don't review blind even if you haven't loaded the full files.
+- Never commit, push, branch, or run `gh pr create` unless the user explicitly asks. Never `--no-verify`.
 
----
+**This file is a router.**
+
+| Before you… | Read |
+|---|---|
+| Write an action, query, schema, or feature | [`STANDARDS.md`](./STANDARDS.md) |
+| Review a diff | [`REVIEW.md`](./REVIEW.md) |
+| Orient / add a feature | [`CLAUDE.md`](./CLAUDE.md) |
+
+## Non-negotiables
+
+1. Every mutation is a server action wrapped in `withAction`. That is the only catch. Return `ActionResult`. Never leak `err.message`.
+2. Auth is the first line inside the action. Other users' ids → not-found, not forbidden.
+3. `"use server"` only at the top of `actions.ts`. No `/api/v1` mutations.
+4. Pino only. Writes call `log.info` + `logAudit`. GETs do neither.
+5. Webhooks verify HMAC on the raw body before parse. Idempotent.
+6. No secret in code / `NEXT_PUBLIC_*`. No module-top-level env throw — `getDb()`.
+7. Rate limit public HTTP by IP; fail open if Redis is missing. Redis is not a response cache.
+8. IP is personal data: audit + client-error / `onRequestError` only.
+9. `APP_ENV` drives source maps. `NODE_ENV` does not.
+10. Feature folders stay split. Cross-feature via `index.ts`.
 
 ## Review guidelines
 
-### 🔴 Block-merge (always raise)
+### Block-merge
 
-- **Auth bypass** — public route handlers that skip authentication, middleware bypass-list growth without justification, or NextAuth callbacks that trust unvalidated JWT claims
-- **Webhook signature missing** — Stripe / Slack / GitHub webhooks must verify signatures **before** dispatching to handlers
-- **Plaintext secret storage** — any new secret column without SHA-256 hashing + `timingSafeEqual` comparison
-- **Module-load throws for runtime env vars** — breaks `next build`'s page-data collection. Use lazy memoized getters
-- **`NOT NULL` added to a populated table without a default** — fails on deploy. Split into nullable → backfill → tighten
-- **FK violations** — passing non-user UUIDs to `audit_logs.user_id` (FK→`users.id`)
-- **Hardcoded secrets in code or committed env files** — must be in GCP Secret Manager / equivalent, never in repo
-- **Missing rate limiting on unauthenticated public routes** — every public route needs a limiter; webhooks are exempt (signature is their gate)
+- `"use server"` inline in JSX
+- Action not wrapped in `withAction` / not returning `ActionResult`
+- Webhook `req.json()` before HMAC
+- Module-load throws for env vars
+- `NOT NULL` on populated table without default
+- Hardcoded secrets
+- `console.*` in app code
+- Redis/CDN cache of authenticated pages
+- Thrown `err.message` across the action boundary
 
-### 🟡 Discuss / suggest
+### Discuss
 
-- Missing `revalidatePath` after a mutation
-- Missing `logAudit` on a state-changing action (reads don't need audit; mutations do)
-- New `AuditAction` value used without adding it to the union in `src/lib/audit.ts`
-- Action returning a non-`ActionResult<T>` shape
-- `"use server"` declared inline rather than at the top of an `actions.ts` file
-- Hardcoded color values (`text-red-500`, `bg-[#1a1a1a]`) — use semantic tokens
-- Hardcoded `px` values (`p-[14px]`, `w-[320px]`) — use Tailwind scale
-- Component filename in PascalCase — should be kebab-case
-- `"use client"` on a `page.tsx` or `layout.tsx` — kills SSR/SEO; extract interactivity into a child component
-- Hand-rolled `useState` form state — every form must use `react-hook-form` + `zodResolver(Schema)` with the same Zod schema the server action validates
-- Top-level barrel imports in client/edge code — Turbopack will misclassify; use sub-path imports
+- Missing `logAudit` or `revalidatePath` on a write
+- New `AuditAction` not in the union
+- Rate limit keyed by user id alone
+- IP on every `log.info`
+- `"use client"` on `page.tsx`
 
-### ⚪ Skip / don't comment
+### Skip
 
-- Style-only nits already auto-fixed by ESLint or Prettier in pre-commit
-- Theoretical race conditions without a concrete attack path
-- Missing tests for trivial helpers
-- DoS / resource exhaustion concerns under realistic load
-- Outdated transitive dependencies (handled separately)
-
----
-
-## Files to skip entirely
-
-Don't post comments on these paths — they're generated, lockfiles, or meta-context rather than reviewable code:
-
-| Path | Reason |
-|---|---|
-| `**/drizzle/0*.sql`, `**/drizzle/meta/**` | Generated by `drizzle-kit`. Review `src/db/schema/`, not the SQL |
-| `bun.lock`, `package-lock.json`, `yarn.lock` | Lockfiles |
-| `**/*.test.ts`, `**/*.test.tsx` | Tests are reviewed by humans; bots have poor signal here |
-| `**/_template/**` | Scaffolding source |
-| `STANDARDS.md`, `CLAUDE.md`, `REVIEW.md`, `AGENTS.md` | Reviewer reads these for context |
-| `**/.next/**`, `**/dist/**`, `**/build/**` | Build artifacts |
-| `**/public/images/**` | Static images |
-
----
+- Prettier nits
+- "Add Sentry / PostHog / Redis response cache" with no sink
 
 ## Confidence calibration
 
-This codebase ships fast. Before posting a comment:
-
-- **Read the file you're commenting on**, not just the diff snippet. Many flags are wrong because they rely on the local diff and miss a guard or import elsewhere in the file.
-- **Don't suggest renames or refactors** that aren't behavior changes unless they're explicitly in the rules above.
-- **Don't recommend a component that doesn't exist** — verify it's in `@/components/ui/` before suggesting it.
-- **Match existing patterns** — if the codebase uses `!==` for a token comparison everywhere, don't suggest `timingSafeEqual` for that one surface unless the secret is stored hashed.
-- If unsure between flagging and not, **don't flag** unless the issue is in the 🔴 or 🟡 lists.
-
----
-
-## Per-PR overrides
-
-For one-off review focus, leave a comment on the PR like:
-
-- `@codex review for security regressions`
-- `@codex review with extra scrutiny on /api/v1/**`
-- `@gemini-code-assist focus on the billing feature`
-
-These override the defaults for that PR only.
+- Read the file, not just the diff
+- Match existing patterns
+- If unsure, don't flag unless block-merge or discuss
 ```
 
 ---
 
 ### 20. REVIEW.md
 
-Create `REVIEW.md` at repo root — full code-review rubric for humans and bots:
+Write `REVIEW.md` in full. Keep in sync with `AGENTS.md` and `STANDARDS.md`.
 
 ```markdown
 # REVIEW.md
 
-Code-review guidelines for this repository. Apply them whether you're reviewing as a human or as an AI bot — the calibration is the same.
+Read [`CLAUDE.md`](./CLAUDE.md) and [`STANDARDS.md`](./STANDARDS.md) first.
 
-For codebase context, read [`CLAUDE.md`](./CLAUDE.md) and [`STANDARDS.md`](./STANDARDS.md) first. The rules below are the **review rubric**.
+## Block-merge
 
----
+- `"use server"` outside an `actions.ts` file top
+- Missing `withAction` / `ActionResult`
+- Webhook signature missing or `req.json()` first
+- Module-load env throws
+- `NOT NULL` without default on populated table
+- FK: non-user UUID in `audit_logs.user_id`
+- `console.*`; stacks in user-facing errors
+- Redis/CDN cache of authenticated HTML/JSON
 
-## Severity rubric
+## Discuss
 
-### 🔴 Block-merge (always raise)
+- Missing `invalidate`/`revalidatePath` or `logAudit` on writes
+- Wrong `fail()` copy; leaking internals
+- IP on every log line
+- Hardcoded color/px; PascalCase filenames
+- Forms without `react-hook-form` + `zodResolver`
 
-- **Auth bypass** — public route handlers that skip authentication; middleware bypass-list growth without a self-auth justification; NextAuth callbacks that trust unvalidated JWT claims
-- **Webhook signature missing** — Stripe / Slack / GitHub webhooks must verify signatures **before** dispatching to handlers
-- **Plaintext secret storage** — any new secret column without SHA-256 hashing + `timingSafeEqual` comparison
-- **Module-load throws for runtime env vars** — breaks `next build`'s page-data collection in CI. Use lazy memoized getters
-- **`NOT NULL` added to a populated table without a default** — fails on deploy. Split into nullable → backfill → tighten
-- **FK / NOT NULL violations** — passing non-user UUIDs to `audit_logs.user_id`, or `undefined` to required columns via partial `set()`
-- **Untrusted metadata reaching enum / index sinks** — webhook body fields cast to typed enums without Zod validation
-- **Missing rate limiting on unauthenticated public routes** — webhooks exempt (signature verification is their gate)
+## Skip
 
-### 🟡 Discuss / suggest
+- Style nits, theoretical races, "add Sentry/PostHog"
 
-- Missing `revalidatePath` after a mutation
-- Missing `logAudit` on a state-changing action
-- New `AuditAction` value used without adding it to the union in `src/lib/audit.ts`
-- Action returning a non-`ActionResult<T>` shape
-- `"use server"` declared inline inside JSX rather than at the top of an `actions.ts` file
-- Hardcoded color values (`text-red-500`, `bg-[#1a1a1a]`) — use semantic tokens (`text-destructive`, `bg-card`)
-- Hardcoded `px` values (`p-[14px]`, `w-[320px]`) — use Tailwind scale (`p-3.5`, `w-80`)
-- Component filename in PascalCase — should be kebab-case
-- `"use client"` on a `page.tsx` or `layout.tsx` — kills SSR/SEO; extract interactivity into a child component
-- Hand-rolled `useState` form state — every form must use `react-hook-form` + `zodResolver(Schema)` with the same Zod schema the server action validates (`home-navbar.tsx`, not `HomeNavbar.tsx`)
-- Top-level barrel imports in client/edge code — Turbopack will misclassify
-- Native `confirm()` / `alert()` in admin UI — use the shadcn `Dialog` primitive
-- Duplicate shadcn components — extend via `cva` variants, don't create parallel components
+## Schema PRs
 
-### ⚪ Skip / don't comment
+Block: schema/SQL drift, NOT NULL without default, dropping live columns.
+Discuss: unused indexes, enum drift.
 
-- Style-only nits already auto-fixed by ESLint or Prettier in pre-commit
-- Theoretical race conditions without a concrete attack path
-- Missing tests for trivial helpers — the project doesn't aim for 100% coverage
-- Lack of audit logs on non-state-changing reads
-- DoS / resource exhaustion concerns under realistic load
-- Outdated transitive dependencies (handled separately)
+## Logging PRs
 
-### Files to skip entirely
-
-| Path | Reason |
-|---|---|
-| `**/drizzle/0*.sql` | Generated by `drizzle-kit`. Review `src/db/schema/`, not the SQL |
-| `**/drizzle/meta/**` | Generated snapshot files |
-| `bun.lock`, `package-lock.json`, `yarn.lock` | Lockfiles |
-| `**/*.test.ts`, `**/*.test.tsx` | Tests are reviewed by humans |
-| `**/_template/**` | Scaffolding source |
-| `STANDARDS.md`, `CLAUDE.md`, `REVIEW.md`, `AGENTS.md` | Reviewer reads these for context — doesn't review them as code |
-| `**/.next/**`, `**/dist/**`, `**/build/**` | Build artifacts |
-| `**/public/images/**` | Static images |
-
-When the diff is _primarily_ in these files (e.g., a "regenerate lockfile" PR), post a single approving comment instead of going line-by-line.
-
----
-
-## Migration / schema PR rubric
-
-When a PR has changes under `drizzle/` or `src/db/schema/`, run this extra checklist before any per-line comments. Migration PRs are high-blast-radius.
-
-### 🔴 Block-merge
-
-- **Schema and SQL drift** — `src/db/schema/<table>.ts` doesn't match the generated `drizzle/000N_*.sql`. Either the SQL was hand-edited or `drizzle-kit generate` wasn't re-run
-- **`NOT NULL` added to a populated table without a default** — will fail in prod on deploy
-- **FK to a table that doesn't exist yet** in the migration order — Postgres rejects the migration
-- **Dropping a column / table referenced by live code** — grep `src/` for the column name; if it's still read or written, the deploy breaks the moment the migration runs
-- **Renaming a column without a data-preserving plan** — Drizzle generates `ADD` + `DROP` for renames, which loses data. Either keep the old column for a release, dual-write, then drop in a follow-up
-
-### 🟡 Discuss
-
-- **New enum value added to the postgres enum but not the TypeScript literal type** (or vice versa) — they have to ship together
-- **Index on a column without a query that needs it** — index bloat
-- **`drizzle-kit generate` produced statements you didn't expect** — e.g., a migration touches an unrelated column because the schema file shifted
-
-### ⚪ Skip
-
-- The exact SQL formatting in `drizzle/000N_*.sql` — generated
-- The `meta/000N_snapshot.json` contents — generated
-
-### Things to verify with the actual code, not the PR description
-
-- "Backfill is safe" → grep for callers of the affected table
-- "This rename is on an empty table" → check the table really is empty in current production
-- "We added a default" → confirm the default is in the generated SQL, not just the TS schema
-
-The PR description is intent; the diff is reality. When they conflict, raise it.
-
----
-
-## Confidence calibration
-
-- **Read the file you're commenting on**, not just the diff snippet
-- **Don't suggest renames or refactors** that aren't behavior changes unless they're in the rules above
-- **Don't recommend a component that doesn't exist** — verify it's installed first
-- **Match existing patterns** rather than imposing external conventions
-- If unsure between flagging and not, **don't flag** unless the issue is in the 🔴 or 🟡 lists
+Block: `console.*`, missing `{ err }` on failures, logging tokens.
+Discuss: event name not `feature.verb`; write without `logAudit`.
 ```
 
 ---
@@ -1956,6 +2087,9 @@ Create `.github/pull_request_template.md`:
 - [ ] Followed [STANDARDS.md](../STANDARDS.md)
 - [ ] Tests pass locally (`bunx vitest run`)
 - [ ] Typecheck + lint pass (`bunx tsc --noEmit`, `bunx next lint`)
+- [ ] Writes use `withAction` + `log.info` + `logAudit` + `revalidatePath`
+- [ ] If adding a webhook: HMAC on raw body, then parse; idempotent
+- [ ] No secrets in code / `NEXT_PUBLIC_*`; no module-top-level env throws
 
 ## Test plan
 
@@ -1968,36 +2102,21 @@ Create `.github/pull_request_template.md`:
 
 ### 22. `next.config.ts`
 
-Create `next.config.ts` at the app root:
-
+`APP_ENV` is a **build ARG** (`local` | `dev` | `prod`). Unset/garbage → `local`. Prod keeps source maps **off**.
 ```typescript
 import type { NextConfig } from "next";
+import { ENVIRONMENT_SETTINGS, appEnvironment } from "./src/lib/app-environment";
+
+const environment = ENVIRONMENT_SETTINGS[appEnvironment(process.env.APP_ENV)];
 
 const nextConfig: NextConfig = {
-  // Required for Docker / Cloud Run deploys — builds a self-contained
-  // output directory instead of relying on node_modules at runtime.
   output: "standalone",
-
-  // Native-Node packages that pull in `fs`, `child_process`, `dns` via
-  // dynamic require — Turbopack/webpack can't trace them statically.
-  // Symptom when missing: "Module not found: Can't resolve 'child_process'"
-  // during `next build`. Add the top-level package whose transitive tree fails.
-  serverExternalPackages: [
-    "pg",
-    "pino",
-  ],
-
-  // ESM-only packages that need to be transpiled for Next.js.
+  productionBrowserSourceMaps: environment.enableBrowserSourceMaps,
+  serverExternalPackages: ["pg", "pino"],
   transpilePackages: [],
-
   images: {
-    remotePatterns: [
-      // Google OAuth profile pictures
-      { protocol: "https", hostname: "lh3.googleusercontent.com" },
-    ],
+    remotePatterns: [{ protocol: "https", hostname: "lh3.googleusercontent.com" }],
   },
-
-  // Security headers — applied to every response
   async headers() {
     return [
       {
@@ -2020,65 +2139,17 @@ export default nextConfig;
 
 ### 23. `instrumentation.ts`
 
-Create `src/instrumentation.ts`:
-
 ```typescript
-/**
- * Next.js server instrumentation — runs once on startup.
- * Validates required env vars and wires up global error capture.
- */
 export async function register(): Promise<void> {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
 
+  const { attachProcessHandlers } = await import("./lib/process-handlers");
+  attachProcessHandlers();
+
   const { log } = await import("./lib/log");
-
-  process.on("uncaughtException", (err) => {
-    log.fatal({ err }, "process.uncaught_exception");
-    process.exit(1);
-  });
-
-  process.on("unhandledRejection", (reason) => {
-    log.fatal({ reason }, "process.unhandled_rejection");
-  });
-
-  process.on("SIGTERM", () => {
-    log.info("process.sigterm — shutting down");
-    process.exit(0);
-  });
-
-  // Fail fast on missing required env vars. Log loudly so a bad deploy
-  // surfaces immediately rather than silently breaking mid-request.
-  const REQUIRED = [
-    "DATABASE_URL",
-    "AUTH_SECRET",
-    "AUTH_GOOGLE_ID",
-    "AUTH_GOOGLE_SECRET",
-    "NEXT_PUBLIC_APP_URL",
-    "UPSTASH_REDIS_REST_URL",
-    "UPSTASH_REDIS_REST_TOKEN",
-    "GMAIL_USER",
-    "GMAIL_APP_PASSWORD",
-  ];
-
-  for (const key of REQUIRED) {
-    if (!process.env[key]) {
-      log.error({ key }, `instrumentation.missing_env — ${key} is not set`);
-    }
-  }
-
-  const appUrl = process.env.NEXT_PUBLIC_APP_URL;
-  if (appUrl) {
-    try {
-      const parsed = new URL(appUrl);
-      if (process.env.NODE_ENV === "production" && parsed.protocol !== "https:") {
-        log.error({ appUrl }, "instrumentation.app_url_not_https");
-      }
-      if (appUrl.endsWith("/")) {
-        log.warn({ appUrl }, "instrumentation.app_url_trailing_slash");
-      }
-    } catch {
-      log.error({ appUrl }, "instrumentation.app_url_invalid");
-    }
+  const required = ["DATABASE_URL", "AUTH_SECRET", "NEXT_PUBLIC_APP_URL"] as const;
+  for (const key of required) {
+    if (!process.env[key]) log.warn({ key }, "instrumentation.missing_env");
   }
 }
 
@@ -2126,6 +2197,8 @@ export async function onRequestError(
 import { useEffect } from "react";
 import { Button } from "@/components/ui/button";
 
+import { reportClientError } from "@/lib/report-client-error";
+
 export default function Error({
   error,
   reset,
@@ -2134,7 +2207,7 @@ export default function Error({
   reset: () => void;
 }) {
   useEffect(() => {
-    console.error(error);
+    reportClientError(error, "error.tsx");
   }, [error]);
 
   return (
@@ -2207,32 +2280,45 @@ IP-based sliding window using Upstash Redis. Works across multiple instances, ru
 3. Plan: **Free** tier (10,000 req/day) is enough for dev and low-traffic prod. For production use **Pay as you go** — rate limit calls are tiny (~1 req per inbound HTTP request), costs stay near zero unless you're handling millions of requests/day
 4. Go to **REST API** tab → copy both values into `.env.local`
 
-**`src/lib/rate-limit.ts`:**
+**`src/lib/rate-limit.ts`** — lazy Redis. Missing Upstash → fail **open** + warn once. Never `Redis.fromEnv()` at import.
 ```typescript
 import { Ratelimit } from "@upstash/ratelimit";
 import { Redis } from "@upstash/redis";
+import { log } from "@/lib/log";
 
-const redis = Redis.fromEnv();
+export type RateLimitResult = { allowed: true } | { allowed: false; retryAfter: number };
 
-export type RateLimitResult =
-  | { allowed: true }
-  | { allowed: false; retryAfter: number };
+function getRedis(): Redis | null {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+  return new Redis({ url, token });
+}
 
 export function createRateLimiter(config: { windowMs: number; max: number }) {
-  const limiter = new Ratelimit({
-    redis,
-    limiter: Ratelimit.slidingWindow(config.max, `${config.windowMs}ms`),
-    // Prefix isolates each limiter's keys in Redis — prevents collisions
-    // when two routes share the same window + max config.
-    prefix: `rl:${config.windowMs}:${config.max}`,
-  });
-
+  let warned = false;
   return async function check(ip: string): Promise<RateLimitResult> {
-    const { success, reset } = await limiter.limit(ip);
-    if (!success) {
-      return { allowed: false, retryAfter: Math.ceil((reset - Date.now()) / 1000) };
+    const redis = getRedis();
+    if (!redis) {
+      if (!warned) {
+        warned = true;
+        log.warn({}, "ratelimit.disabled_no_redis");
+      }
+      return { allowed: true };
     }
-    return { allowed: true };
+    try {
+      const limiter = new Ratelimit({
+        redis,
+        limiter: Ratelimit.slidingWindow(config.max, `${config.windowMs}ms`),
+        prefix: `rl:${config.windowMs}:${config.max}`,
+      });
+      const { success, reset } = await limiter.limit(ip);
+      if (!success) return { allowed: false, retryAfter: Math.ceil((reset - Date.now()) / 1000) };
+      return { allowed: true };
+    } catch (err) {
+      log.warn({ err }, "ratelimit.redis_error_fail_open");
+      return { allowed: true };
+    }
   };
 }
 ```
@@ -2268,12 +2354,68 @@ export async function POST(req: NextRequest) {
 | Client error reporting | 1 min | 10 | Log-bill flood prevention |
 
 **Rules:**
-- Always use IP as the key — never user ID alone (logged-out users have no ID)
-- Apply to every **unauthenticated** public route — if anyone can call it without a session, it needs a limiter
-- **Do not** rate limit webhook endpoints (Stripe, Slack, GitHub) — use signature verification; their IPs rotate and a limit will drop legitimate events
-- **Do not** rate limit authenticated routes — use per-account quota (billing layer) instead
-- Always return `Retry-After` header — clients and browsers respect it
-- `"unknown"` IPs share one bucket — this is intentional; it's a safe fallback that still throttles
+- Always use IP as the key — never user ID alone
+- Apply to unauthenticated public HTTP routes — webhooks and `/api/health` are exempt
+- Fail **open** if Redis is missing or throws
+- Redis is **not** a page/JSON cache. After writes, `revalidatePath`.
+- Always return `Retry-After`
+- `"unknown"` IPs share one bucket
+
+---
+
+### 25b. Webhooks — raw body, then parse
+
+Canonical handler. **Never** `req.json()` before verify.
+
+**`src/lib/webhook.ts`:**
+```typescript
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { webhookSecret } from "@/lib/env";
+
+export function verifyHmacSha256(rawBody: string, header: string | null): boolean {
+  const secret = webhookSecret();
+  if (!secret || !header) return false;
+  const digest = createHmac("sha256", secret).update(rawBody).digest("hex");
+  const a = Buffer.from(digest);
+  const b = Buffer.from(header);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+```
+
+**`src/app/api/webhooks/stripe/route.ts`:**
+```typescript
+import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
+import { log } from "@/lib/log";
+import { verifyHmacSha256 } from "@/lib/webhook";
+
+export const runtime = "nodejs";
+
+const EventSchema = z.object({
+  id: z.string().max(200),
+  type: z.string().max(100),
+});
+
+export async function POST(req: NextRequest) {
+  const raw = await req.text();
+  if (!verifyHmacSha256(raw, req.headers.get("x-webhook-signature"))) {
+    log.warn({}, "webhooks.signature_rejected");
+    return NextResponse.json({ error: "Invalid signature." }, { status: 401 });
+  }
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    return NextResponse.json({ error: "Invalid payload." }, { status: 400 });
+  }
+  const parsed = EventSchema.safeParse(json);
+  if (!parsed.success) {
+    return NextResponse.json({ error: "Invalid payload." }, { status: 400 });
+  }
+  log.info({ eventId: parsed.data.id, type: parsed.data.type }, "webhooks.received");
+  return NextResponse.json({ received: true });
+}
+```
 
 ---
 
@@ -2804,31 +2946,22 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# Build-time env vars — pass via --build-arg or your platform's build settings.
-# Required because `next build` collects page data at build time.
-ARG DATABASE_URL
-ARG AUTH_SECRET
-ARG AUTH_GOOGLE_ID
-ARG AUTH_GOOGLE_SECRET
+ARG APP_ENV=dev
 ARG NEXT_PUBLIC_APP_URL
-ARG UPSTASH_REDIS_REST_URL
-ARG UPSTASH_REDIS_REST_TOKEN
-ENV DATABASE_URL=${DATABASE_URL}
-ENV AUTH_SECRET=${AUTH_SECRET}
-ENV AUTH_GOOGLE_ID=${AUTH_GOOGLE_ID}
-ENV AUTH_GOOGLE_SECRET=${AUTH_GOOGLE_SECRET}
-ENV NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
-ENV UPSTASH_REDIS_REST_URL=${UPSTASH_REDIS_REST_URL}
-ENV UPSTASH_REDIS_REST_TOKEN=${UPSTASH_REDIS_REST_TOKEN}
+ENV APP_ENV=$APP_ENV
+ENV NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL
 ENV NEXT_TELEMETRY_DISABLED=1
 
 RUN bun run build
 
-# ── Stage 3: Production runtime (Node, not Bun — Next.js runtime stays Node) ─
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
+ARG APP_ENV=dev
+ENV APP_ENV=$APP_ENV
+ARG NEXT_PUBLIC_APP_URL
+ENV NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL
 
 # Non-root user for runtime
 RUN addgroup -S nodejs && adduser -S nextjs -G nodejs
@@ -2857,7 +2990,6 @@ node_modules
 .idea
 .DS_Store
 *.log
-*.lock
 *.tsbuildinfo
 
 # Env files — pass secrets via build args, not COPY
@@ -2921,9 +3053,6 @@ Ensure these are in `.gitignore`:
 .env.production
 .env*.local
 
-# Drizzle
-drizzle/meta/
-
 # Build output
 .next/
 out/
@@ -2947,7 +3076,9 @@ bunx vitest run
 bunx next build
 ```
 
-All should pass before the first commit.
+All should pass before the first commit. `next build` must succeed with dummy `DATABASE_URL` (lazy `getDb()`). Confirm `productionBrowserSourceMaps` is false when `APP_ENV=prod`.
+
+**Post-scaffold (human, not the model):** Neon, Google OAuth, Upstash Redis, Vercel tokens, optional tweakcn, `WEBHOOK_SECRET` when you add a vendor.
 
 First commit:
 ```bash
@@ -2961,34 +3092,20 @@ git commit -m "chore: initial project setup"
 
 | Piece | What it does |
 |---|---|
-| Bun package manager | Fast installs, Vitest integration. Next.js runtime stays on Node.js |
-| Husky hooks | Enforces format, lint, types, tests, audit on every push |
-| Conventional commits | Enforced by commit-msg hook |
-| Feature template | Every feature has the same shape — onboard anyone instantly |
-| `bun run create-feature` | One-command scaffolder copies template, replaces tokens, prints next steps |
-| `ActionResult<T>` | No thrown errors crossing server/client boundary |
-| Zod conventions | `safeParse` only, every string `.max()`, user-facing messages, boundary-only validation |
-| Forms | `react-hook-form` + `zodResolver` everywhere — same schema as the server action, no `useState` form state |
-| Pino logger | Structured JSON, GCP-severity compatible, secret redaction, `feature.verb` event names |
-| Client error reporting | `/api/log/client-error` + `reportClientError()` — no swallowed errors |
-| Audit trail | Every write has `logAudit` — compliance-ready from day one |
-| Drizzle + NeonDB | Schema-first migrations, pooled URL for app, direct URL for drizzle-kit |
-| Upstash Redis | Serverless Redis for rate limiting — edge + Node.js compatible |
-| NextAuth v5 + Google | Production auth with extracted server actions, no inline `"use server"` |
-| Vitest + mock builders | Consistent 3-case test pattern across all features |
-| shadcn/ui + tweakcn theme | CSS variables from tweakcn.com, full token set, no hardcoded colours |
-| Styling conventions | Kebab-case filenames, no hardcoded px/colours, Tailwind scale + semantic tokens |
-| `.env.example` | Every env var documented, nothing secret in git |
-| `next.config.ts` | `standalone` output, `serverExternalPackages`, security headers |
-| `instrumentation.ts` | Startup env validation + global `onRequestError` capture with digest |
-| Error/loading pages | `error.tsx`, `global-error.tsx`, `not-found.tsx`, `loading.tsx` |
-| Rate limiting | IP-based, Upstash sliding window, works in middleware + route handlers |
-| CI workflow | Parallel lint/format/typecheck/audit/test jobs, build gates on all passing |
-| Governance docs | `CLAUDE.md`, `STANDARDS.md`, `AGENTS.md`, `REVIEW.md` — full rule + review rubric |
-| PR template | `.github/pull_request_template.md` — checklist for every change |
-| Email | Nodemailer + Gmail SMTP via App Password — swap transport for Resend/Postmark later |
-| SEO | `sitemap.ts`, `robots.ts`, OG image conventions, root + per-page metadata patterns |
-| Vercel deploy | GitHub Actions workflow + `vercel.json` to disable auto-deploy |
-| Dockerfile | Multi-stage Bun→Node build using `output: "standalone"` for non-Vercel hosts |
+| Bun package manager | Fast installs. Next.js runtime stays Node.js |
+| **Server actions + `withAction`** | One catch. `ActionResult` envelope. Auth first. No `/api/v1` mutations |
+| Drizzle + Postgres | Lazy `getDb()`, TLS verify on |
+| NextAuth v5 + Google | JWT sessions; adapter via `getDb()` proxy |
+| Pino logger | JSON + GCP severity, `APP_LOG_FILE`, redaction, `no-console` |
+| Audit trail | `log.info` + `logAudit` on writes. IP on audit, not every log line |
+| Rate limit | IP middleware; Redis for this only; fail open. No Redis response cache |
+| Webhooks | HMAC on raw body, then parse; idempotent |
+| Client errors | Same-origin, Zod, rate-limited `/api/log/client-error` |
+| Source maps | `APP_ENV` build ARG — on local/dev, **off prod** |
+| Governance docs | `CLAUDE.md` · `AGENTS.md` · `STANDARDS.md` · `REVIEW.md` — written in full |
+| Dockerfile | Bun→Node 22, `APP_ENV` + `NEXT_PUBLIC_*` only at build — no secrets in the image |
+| shadcn/ui | CSS variables (tweakcn optional later) |
+| Forms | `react-hook-form` + `zodResolver` + same schema as the action |
+| Feature template | `schema → queries → actions → index → components` |
 
 ## PROMPT END
